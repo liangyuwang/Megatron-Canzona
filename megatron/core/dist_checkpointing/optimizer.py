@@ -106,6 +106,43 @@ def make_sharded_optimizer_tensor(
     return sh_ten
 
 
+def make_sharded_optimizer_tensor_new_shape(
+    model_param: Union[ShardedTensor, ShardedTensorFactory], optim_param: torch.Tensor, prefix: str
+) -> Union[ShardedTensor, ShardedTensorFactory]:
+    """Build a ShardedTensor or ShardedTensorFactory for optimizer param based on model param but with different shape
+    Args:
+        model_param (Union[ShardedTensor, ShardedTensorFactory]): model param
+        optim_param (torch.Tensor): corresponding optimizer param
+        prefix (str): optimizer prefix for the ShardedTensor or ShardedTensorFactory
+    Returns:
+        Union[ShardedTensor, ShardedTensorFactory]: wrapped optimizer parameter
+    """
+    optim_param = torch.atleast_2d(optim_param)
+    if isinstance(model_param, ShardedTensorFactory):
+        new_shared = model_param.build()
+        af = new_shared[0].axis_fragmentations
+        replace_kwargs = dict(
+                key=f'{prefix}.{model_param.key}',
+                data=optim_param,
+                dtype=optim_param.dtype,
+                global_shape= new_shared[0].global_shape[:-2] + optim_param.shape,
+                local_shape = optim_param.shape,
+                axis_fragmentations = af[:-2]+(1,)+af[-1:]
+        )
+        sh_ten = replace(new_shared[0], **replace_kwargs)
+    else:
+        replace_kwargs = dict(
+                key=f'{prefix}.{model_param.key}',
+                data=optim_param,
+                dtype=optim_param.dtype,
+                global_shape= model_param.global_shape[:-2] + optim_param.shape,
+                local_shape = optim_param.shape
+        )
+        sh_ten = replace(model_param, **replace_kwargs)
+    sh_ten.validate_metadata_integrity()
+    return sh_ten
+
+
 def optim_state_to_sharding_state(
     optim_state_dict: StateDict,
     id_to_sharded_param_map: Dict[int, ShardedTensor],
@@ -136,9 +173,14 @@ def optim_state_to_sharding_state(
             if state_key in exclude_keys:
                 continue
             if param_id in id_to_sharded_param_map:
-                sharded_state[param_id][state_key] = make_sharded_optimizer_tensor(
-                    id_to_sharded_param_map[param_id], param, prefix=f'optimizer.state.{state_key}'
-                )
+                if state_key in ['exp_avg', 'exp_avg_sq', 'momentum_buffer', 'fp32_param']: # for os shape same as weight
+                    sharded_state[param_id][state_key] = make_sharded_optimizer_tensor(
+                        id_to_sharded_param_map[param_id], param, prefix=f'optimizer.state.{state_key}'
+                    )
+                else: # for others
+                    sharded_state[param_id][state_key] = make_sharded_optimizer_tensor_new_shape(
+                        id_to_sharded_param_map[param_id], param, prefix=f'optimizer.state.{state_key}'
+                    )
             else:
                 raise ValueError(f'Param id {param_id} does not match any model sharded param')
 

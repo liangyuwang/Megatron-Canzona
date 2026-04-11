@@ -520,6 +520,7 @@ class _ParamAndGradBuffer:
         gradient_scaling_factor: float,
         param_indices: List[int],
         nccl_ub: bool,
+        is_matrix_based_opt=False
     ):
         self.ddp_config = ddp_config
         self.params = params
@@ -779,7 +780,7 @@ class _ParamAndGradBuffer:
                 f"{bucket.grad_data.nelement()} padded size):"
             )
             for param in bucket.params:
-                log_strs.append(f"\t{param_to_name[param]}")
+                log_strs.append(f'\t{param_to_name[param], param.shape, 'Matrix Based Optimizer' if is_matrix_based_opt else 'Adam Optimizer'}')
         log_on_each_pipeline_stage(logger, logging.INFO, "\n".join(log_strs))
 
     def scale_gradients(self, scaling_factor: float) -> None:

@@ -126,6 +126,9 @@ class DistributedDataParallelConfig:
     This option is only effective when Hybrid FSDP is enabled.
     """
 
+    use_matrix_based_optimizer: bool = False
+    """If true, use matrix based optimizer, prepare several paramter groups"""
+
     def __post_init__(self):
         import os
 

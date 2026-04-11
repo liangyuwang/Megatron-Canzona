@@ -83,6 +83,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_msc_args(parser)
     parser = _add_kitchen_quantization_arguments(parser)
     parser = _add_sft_args(parser)
+    parser = _add_canzona_args(parser)
 
     return parser
 
@@ -1108,6 +1109,38 @@ def validate_args(args, defaults={}):
             args.recompute_granularity != 'full'
         ), 'recompute_granularity must not be full when CUDA Graphs are enabled.'
 
+    # Matrix-based optimizer
+    if args.optimizer in ['soap','muon']:
+        assert not (args.use_megatron_fsdp or args.use_torch_fsdp2), "Canzona does not support FSDP."
+        assert not args.optimizer_cpu_offload, "Canzona does not support Optimizer CPU offloading."
+        if args.num_experts:
+            if args.tensor_model_parallel_size > 1 and args.expert_tensor_parallel_size > 1:
+                raise NotImplementedError("FOR Matrix Based optimizer, tp with ep-tp is not supported yet.")
+            assert args.expert_tensor_parallel_size == 1, "Canzona does not support expert_tensor_parallel"
+    if args.matrix_based_optimizer_split_qkv_per_head:
+        assert args.matrix_based_optimizer_split_qkv, "qkv per-head split only works when splitting qkv"
+    if args.matrix_based_optimizer_split_linear_attn_per_head:
+        assert args.matrix_based_optimizer_split_linear_attn, "linear attention per-head split only works when splitting linear attn"
+    # Canzona optimizer sanity checks
+    if any([
+        args.use_dp_balanced_opt,
+        args.dp_balanced_opt_log_visualization,
+        args.use_tp_balanced_opt,
+        args.tp_balanced_opt_log_visualization,
+    ]):
+        assert args.optimizer in ['muon', 'soap'], \
+            "Canzona optimizer features (async tp opt and load-balanced-opt) only support muon and soap for now"
+    if args.use_dp_balanced_opt:
+        assert args.use_distributed_optimizer, 'Canzona dp balance requires zero-1'
+    if args.dp_balanced_opt_log_visualization and args.dp_balanced_opt_log_path is None:
+        args.dp_balanced_opt_log_path = os.path.join(os.path.dirname(args.tensorboard_dir),f'canzona-{args.optimizer}-dplb-{args.use_dp_balanced_opt}-tplb-{args.use_tp_balanced_opt}') #save dp balanced opt log to tensorboard_dir by default
+    if args.tp_balanced_opt_log_visualization and args.tp_balanced_opt_log_path is None:
+        args.tp_balanced_opt_log_path = os.path.join(os.path.dirname(args.tensorboard_dir),f'canzona-{args.optimizer}-dplb-{args.use_dp_balanced_opt}-tplb-{args.use_tp_balanced_opt}') #save tp balanced opt log to tensorboard_dir by default
+    if args.tp_balanced_opt_log_visualization and args.rank == 0:
+        os.makedirs(args.tp_balanced_opt_log_path, exist_ok=True)
+    if args.dp_balanced_opt_log_path and args.rank == 0:
+        os.makedirs(args.dp_balanced_opt_log_path, exist_ok=True)
+
     # Print arguments.
     _print_args("arguments", args)
 
@@ -1965,7 +1998,7 @@ def _add_training_args(parser):
                        help='Enable bias only in the QKV linear layers',
                        dest='add_qkv_bias')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd'],
+                       choices=['adam', 'sgd', 'muon', 'soap'],
                        help='Optimizer function')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')
@@ -3080,4 +3113,63 @@ def _add_sft_args(parser):
     group.add_argument('--sft', action="store_true", help='Megatron SFT training')
     group.add_argument('--sft-tokenizer-prompt-format', type=str, default="nemotron-h-aligned", 
                        help='SFT prompt format.')
+    return parser
+
+def _add_canzona_args(parser):
+    """
+    https://arxiv.org/pdf/2602.06079
+    """
+    group = parser.add_argument_group(title='canzona')
+    # Matrix based optimizer splitting
+    group.add_argument('--matrix-based-optimizer-split-qkv', action='store_true', help='Use matrix based optimizer with split qkv')
+    group.add_argument('--matrix-based-optimizer-split-fc1', action='store_true', help='Use matrix based optimizer with split fc1')
+    group.add_argument('--matrix-based-optimizer-split-linear-attn', action='store_true', help='Use matrix based optimizer with split linear attention')
+    group.add_argument('--matrix-based-optimizer-split-qkv-per-head', action='store_true', help='Use per-head splitting for matrix-based optimizer full-attention qkv.')
+    group.add_argument('--matrix-based-optimizer-split-linear-attn-per-head', action='store_true', help='Use per-head splitting for matrix-based optimizer linear-attention in_proj.')
+    # Muon specific arguments
+    group.add_argument('--nesterov-acceleration', action='store_true', help='Use Nesterov momentum')
+    group.add_argument('--muon-ns-steps', type=int, default=5, help='Number of NS steps for Muon')
+    group.add_argument("--muon-ns-coefficient-type", type=str, default="simple",
+                choices=["simple", "quintic", "polar_express", "aol_nvidia", "qwen_express"], help="NS coefficient set for Muon")
+    group.add_argument('--muon-ns-norm-eps', type=float, default=1e-7, help='Normalization epsilon for NS in Muon')
+    # SOAP specific arguments
+    group.add_argument('--shampoo-beta', type=float, default=0.99,
+                       help='Beta parameter for L/R')
+    group.add_argument('--soap-precondition-frequency', type=int, default=10)
+    group.add_argument('--soap-max-precond-dim', type=int, default=10000)
+    group.add_argument('--soap-merge-dims', action='store_true')
+    group.add_argument('--soap-precondition-1d', action='store_true')
+    group.add_argument('--soap-normalize-grads', action='store_true')
+    group.add_argument('--soap-data-format', type=str, default='channels_first', choices=['channels_first', 'channels_last'])
+    group.add_argument('--soap-correct-bias', action='store_true')
+    # Canzona Related
+    # DP Balanced Optimizer
+    group.add_argument('--use-dp-balanced-opt', action='store_true',
+                       help='Enable DP balanced optimizer.')
+    group.add_argument('--dp-balanced-opt-alpha', type=float, default=1.0,
+                       help='Alpha parameter for DP balanced optimizer. Default is 1.0.')
+    group.add_argument('--dp-balanced-opt-log-visualization', action='store_true',
+                       help='Enable log visualization for DP balanced optimizer.')
+    group.add_argument('--dp-balanced-opt-log-path', type=str, default=None,
+                       help='Path for DP balanced optimizer log visualization.')
+    group.add_argument('--dp-balanced-opt-cost', type=str, default="numel", choices=["numel", "flops"],
+                       help='Cost model for DP balanced optimizer. Choices: "numel", "flops". Default is "numel".')
+    # TP Async Optimizer
+    group.add_argument('--use-tp-sync-opt', action='store_false',
+                       dest='use_tp_async_opt',
+                       help='Disable TP async optimizer.')
+    group.add_argument('--no-async-tp-fuse-comm', action='store_false',
+                       dest='async_tp_fuse_comm',
+                       help='Enable fused communication for async TP optimizer.')
+    # TP Balanced Optimizer
+    group.add_argument('--use-tp-balanced-opt', action='store_true',
+                       help='Enable TP balanced optimizer.')
+    group.add_argument('--tp-balanced-opt-log-visualization', action='store_true',
+                       help='Enable log visualization for TP balanced optimizer.')
+    group.add_argument('--tp-balanced-opt-log-path', type=str, default=None,
+                       help='Path for TP balanced optimizer log visualization.')
+    group.add_argument('--tp-balanced-opt-fuse-space', type=int, default=400,
+                       help='Fusion space size in MB for TP balanced optimizer. Default is 400.')
+    group.add_argument('--tp-balanced-opt-cost', type=str, default="numel", choices=["numel", "flops"],
+                       help='Cost model for TP balanced optimizer. Choices: "numel", "flops". Default is "numel".')
     return parser

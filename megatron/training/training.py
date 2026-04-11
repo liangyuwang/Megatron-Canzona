@@ -138,6 +138,8 @@ stimer = StragglerDetector()
 
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 
+from megatron.core.optimizer.matrix_based_optimizer import is_matrix_based_optim
+
 
 def destroy_global_state():
     destroy_global_vars()
@@ -1207,6 +1209,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 kwargs['bucket_size'] = args.ddp_bucket_size
             kwargs['pad_buckets_for_high_nccl_busbw'] = args.ddp_pad_buckets_for_high_nccl_busbw
             kwargs['average_in_collective'] = args.ddp_average_in_collective
+            kwargs['use_matrix_based_optimizer'] = is_matrix_based_optim(args.optimizer)
             if args.use_megatron_fsdp and args.use_precision_aware_optimizer:
                 kwargs["preserve_fp32_weights"] = False
             ddp_config = DistributedDataParallelConfig(**kwargs)
@@ -1325,6 +1328,7 @@ def setup_model_and_optimizer(
             kwargs[f.name] = getattr(args, f.name)
     config = OptimizerConfig(**kwargs)
     config.timers = timers
+    config.split_matrix_based_optimizer_params = args.matrix_based_optimizer_split_qkv or args.matrix_based_optimizer_split_fc1 or args.matrix_based_optimizer_split_linear_attn
     optimizer = get_megatron_optimizer(
         config,
         model,

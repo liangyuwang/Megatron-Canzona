@@ -1,4 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+import os
 import logging
 import warnings
 from typing import Callable, Dict, List, Optional, Tuple
@@ -42,6 +43,13 @@ from .optimizer import (
 )
 from .optimizer_config import OptimizerConfig
 
+from .matrix_based_optimizer import Muon
+from .matrix_based_optimizer import SOAP
+from .matrix_based_optimizer import DistMatrixBasedOptimizer
+from .matrix_based_optimizer import is_param_use_matrix_based_optim
+from .matrix_based_optimizer import is_matrix_based_optim, is_matrix_based_optim_group
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -82,6 +90,8 @@ def _get_param_groups(
     Returns:
         List of parameter groups.
     """
+    from megatron.training import get_args
+    args = get_args()
 
     use_decoupled_learning_rate = decoupled_lr is not None
 
@@ -93,6 +103,7 @@ def _get_param_groups(
                 continue
 
             is_expert_parallel = not getattr(param, 'allreduce', True)
+            is_tensor_parallel = getattr(param, 'tensor_model_parallel', False) and not is_expert_parallel # discard 'expert_tensor_parallel'
 
             if no_weight_decay_cond is not None:
                 no_wd: bool = no_weight_decay_cond(name, param)
@@ -129,7 +140,23 @@ def _get_param_groups(
             ):
                 is_decoupled_lr = True
 
-            key = (wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr)
+            use_muon = is_param_use_matrix_based_optim(name, param) if args.optimizer == 'muon' else False
+            use_soap = is_param_use_matrix_based_optim(name, param) if args.optimizer == 'soap' else False
+            if use_muon or use_soap:
+                if args.matrix_based_optimizer_split_qkv and 'linear_qkv.weight' in name:
+                    param.is_full_attn_qkv = True
+                if args.matrix_based_optimizer_split_fc1 and 'linear_fc1.weight' in name:
+                    assert args.swiglu, 'Only swiglu need to split linear_fc1'
+                    if 'shared_experts' in name:
+                        param.is_shared_expert_fc1 = True
+                    elif 'experts' in name:
+                        param.is_expert_fc1 = True
+                    else:
+                        param.is_mlp_fc1 = True
+                if args.matrix_based_optimizer_split_linear_attn and 'in_proj.weight' in name:
+                    param.is_linear_attn_inproj = True
+            
+            key = (wd_mult, _lr_mult, is_expert_parallel, is_tensor_parallel, is_decoupled_lr, use_muon, use_soap)
             if key not in params_map:
                 params_map[key] = []
             params_map[key].append(param)
@@ -147,14 +174,17 @@ def _get_param_groups(
 
     param_groups = []
     for key in params_key:
-        wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr = key
+        wd_mult, _lr_mult, is_expert_parallel, is_tensor_parallel, is_decoupled_lr, use_muon, use_soap = key
         params = params_map[key] if key in params_map else []
         param_group = {
             'params': params,
             'wd_mult': wd_mult,
             'lr_mult': _lr_mult,
             'is_expert_parallel': is_expert_parallel,
+            'is_tensor_parallel': is_tensor_parallel,
             'is_decoupled_lr': is_decoupled_lr,
+            'use_muon': use_muon,
+            'use_soap': use_soap,
         }
         # Ensure param_group has required keys for matching when loading optimizer state
         # See MegatronOptimizer._filter_and_reorder_param_groups.
@@ -295,6 +325,60 @@ def _get_megatron_optimizer_based_on_param_groups(
     Returns:
         Instance of MegatronOptimizer.
     """
+    from megatron.training import get_args
+    
+    set_dummy_params = len(param_groups) == 0
+    if set_dummy_params:
+        param_groups = [torch.tensor(0.0, requires_grad=True)]    # split param for matrix-based-optimizer
+    
+    matrix_based_optimizer = (
+        (config.optimizer == "muon" and param_groups[0]['use_muon'])
+        or (config.optimizer == "soap" and param_groups[0]['use_soap'])
+    )
+    split_matrix_based_optimizer_shape_map = {}
+    if matrix_based_optimizer:
+        args = get_args()
+        # due to CANZONA, tp_size is always 1, but we keep the logic here for clarity and future extension when CANZONA is not used
+        tp_size = 1
+        if args.matrix_based_optimizer_split_qkv:
+            if args.matrix_based_optimizer_split_qkv_per_head:
+                qkv_shape = [args.kv_channels, args.attention_output_gate + 1]
+                split_matrix_based_optimizer_shape_map['is_full_attn_qkv'] = qkv_shape
+                split_matrix_based_optimizer_shape_map['is_full_attn_qkv_num_heads'] = [args.num_attention_heads // tp_size, args.num_query_groups // tp_size]
+            else:
+                qkv_shape = [args.kv_channels, args.num_attention_heads // tp_size, args.num_query_groups // tp_size, args.attention_output_gate + 1]
+                split_matrix_based_optimizer_shape_map['is_full_attn_qkv'] = qkv_shape
+        if args.matrix_based_optimizer_split_fc1:
+            assert args.swiglu, 'Only swiglu need to split linear_fc1'
+            if args.num_experts is not None:
+                if args.moe_shared_expert_intermediate_size is not None:
+                    shared_expert_fc1_shape = [args.moe_shared_expert_intermediate_size // tp_size, args.moe_shared_expert_intermediate_size // tp_size]
+                    split_matrix_based_optimizer_shape_map['is_shared_expert_fc1'] = shared_expert_fc1_shape
+                expert_fc1_shape = [args.ffn_hidden_size // tp_size, args.ffn_hidden_size // tp_size]
+                split_matrix_based_optimizer_shape_map['is_expert_fc1'] = expert_fc1_shape
+            else:
+                split_matrix_based_optimizer_shape_map['is_mlp_fc1'] = [args.ffn_hidden_size // tp_size, args.ffn_hidden_size // tp_size]
+        if args.matrix_based_optimizer_split_linear_attn:
+            if args.matrix_based_optimizer_split_linear_attn_per_head:
+                qkvzba_shape = [args.linear_key_head_dim,
+                                args.linear_key_head_dim,
+                                args.linear_value_head_dim,
+                                (args.linear_value_head_dim),
+                                1,
+                                1
+                                ]
+                split_matrix_based_optimizer_shape_map['is_linear_attn_inproj'] = qkvzba_shape
+                split_matrix_based_optimizer_shape_map['is_linear_attn_inproj_num_heads'] = [args.linear_num_key_heads // tp_size, args.linear_num_value_heads // tp_size]
+            else:
+                qkvzba_shape = [args.linear_key_head_dim * args.linear_num_key_heads // tp_size,
+                                args.linear_key_head_dim * args.linear_num_key_heads // tp_size,
+                                args.linear_value_head_dim * args.linear_num_value_heads // tp_size,
+                                (args.linear_num_value_heads * args.linear_value_head_dim) // tp_size,
+                                args.linear_num_value_heads // tp_size,
+                                args.linear_num_value_heads // tp_size
+                                ]
+                split_matrix_based_optimizer_shape_map['is_linear_attn_inproj'] = qkvzba_shape
+
     # when freezing sub-models we may have no trainable parameters on a rank and
     # hence an empty param_groups. However, we still need to create an optimizer
     # for the purposes of grad stats reductions
@@ -338,7 +422,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                 **optimizer_defaults,
             )
             init_state_fn = None
-        elif config.optimizer == 'adam':
+        elif config.optimizer == 'adam' or (is_matrix_based_optim(config.optimizer) and not is_matrix_based_optim_group(param_groups[0])):
             kwargs = {
                 "params": param_groups,
                 "lr": config.lr,
@@ -391,11 +475,77 @@ def _get_megatron_optimizer_based_on_param_groups(
                 momentum=config.sgd_momentum,
             )
             init_state_fn = None
+
+        elif config.optimizer == 'muon' and param_groups[0]['use_muon']:
+            if os.getenv("CUBLAS_WORKSPACE_CONFIG") is not None:
+                raise RuntimeError("Please unset the CUBLAS_WORKSPACE_CONFIG environment variable to accelerate Newton-Schulz iteration")
+            optimizer = Muon(
+                param_groups,
+                lr=config.lr,
+                weight_decay=config.weight_decay,
+                adamw_betas=(config.adam_beta1, config.adam_beta2),
+                adamw_eps=config.adam_eps,
+                ns_steps=config.muon_ns_steps,
+                ns_coefficient_type=config.muon_ns_coefficient_type,
+                ns_norm_eps=config.muon_ns_norm_eps,
+                nesterov=config.nesterov_acceleration,
+                split_muon_params=config.split_matrix_based_optimizer_params,
+                split_muon_shape_map=split_matrix_based_optimizer_shape_map,
+                async_tp=config.use_tp_async_opt
+            )
+            def init_state_fn(opt):
+                if config.split_matrix_based_optimizer_params and config.use_tp_async_opt:
+                    raise NotImplementedError(f'init_state_fn incorrect for split and asyc tp, expected not enabled')
+                for group in opt.param_groups:
+                    for p in group['params']:
+                        if len(opt.state[p]) == 0:
+                            if group["use_muon"]:
+                                opt.state[p]["momentum_buffer"] = torch.zeros_like(p.data)
+        elif config.optimizer == 'soap' and param_groups[0]['use_soap']:
+            args = get_args()
+            optimizer = SOAP(
+                param_groups,
+                lr=config.lr,
+                betas=(config.adam_beta1, config.adam_beta2),
+                shampoo_beta=config.shampoo_beta,
+                eps=config.adam_eps,
+                weight_decay=config.weight_decay,
+                precondition_frequency=config.soap_precondition_frequency,
+                max_precond_dim=config.soap_max_precond_dim,
+                merge_dims=config.soap_merge_dims,
+                precondition_1d=config.soap_precondition_1d,
+                normalize_grads=config.soap_normalize_grads,
+                data_format=config.soap_data_format,
+                correct_bias=config.soap_correct_bias,
+                split_soap_params=config.split_matrix_based_optimizer_params,
+                split_soap_shape_map=split_matrix_based_optimizer_shape_map,
+                async_tp=config.use_tp_async_opt
+            )
+            def init_state_fn(opt):
+                if config.split_matrix_based_optimizer_params and config.use_tp_async_opt:
+                    raise NotImplementedError(f'init_state_fn incorrect for split and asyc tp, expected not enabled')
+                for group in opt.param_groups:
+                    for p in group['params']:
+                        if len(opt.state[p]) == 0:
+                            opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
+                            opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
+                            for idx, sh in enumerate(p.shape):
+                                if sh > args.soap_max_precond_dim:
+                                    pass
+                                else:
+                                    opt.state[p][f'GG_{idx}'] = torch.zeros((sh, sh), device=p.device, dtype=p.dtype)
+                                    opt.state[p][f'Q_{idx}'] = torch.zeros((sh, sh), device=p.device, dtype=p.dtype)
+                            opt.state[p]["step"] = torch.zeros((1,), dtype=p.dtype, device=p.device)
+        
         else:
             raise Exception('{} optimizer is not supported.'.format(config.optimizer))
     else:
         optimizer = None
         init_state_fn = None
+
+    if set_dummy_params:
+        optimizer.param_groups[0]['params'].pop()
+        assert len(optimizer.param_groups[0]['params']) == 0
 
     # Mixed precision optimizer.
     # - Note: both the Float16Optimizer and the DistributedOptimizer inherit
@@ -429,7 +579,8 @@ def _get_megatron_optimizer_based_on_param_groups(
 
         optimizer_args = [optimizer, config, grad_scaler, init_state_fn]
         if config.use_distributed_optimizer:
-            optimizer = DistributedOptimizer(
+            dist_optim_cls = DistMatrixBasedOptimizer if matrix_based_optimizer else DistributedOptimizer
+            optimizer = dist_optim_cls(
                 *optimizer_args,
                 model_chunks=model_chunks,
                 per_model_buffers=per_model_buffers,
@@ -678,7 +829,7 @@ def get_megatron_optimizer(
             no_weight_decay_cond=no_weight_decay_cond,
             scale_lr_cond=scale_lr_cond,
             lr_mult=lr_mult,
-            filter_fn=lambda g: not g['is_expert_parallel'],
+            filter_fn=lambda g: not g['is_expert_parallel'] and not is_matrix_based_optim_group(g),
             buffer_name='buffers',
             default_skip_embedding_weight_decay=default_skip_embedding_weight_decay,
         )
@@ -701,6 +852,31 @@ def get_megatron_optimizer(
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
             )
         )
+        matrix_based_opt_param_groups, matrix_based_opt_buffers = _get_param_groups_and_buffers(
+            dense_model_chunks,
+            model_chunk_offset=model_chunk_offset,
+            config=config,
+            no_weight_decay_cond=no_weight_decay_cond,
+            scale_lr_cond=scale_lr_cond,
+            lr_mult=lr_mult,
+            filter_fn=lambda g: not g['is_expert_parallel'] and is_matrix_based_optim_group(g),
+            buffer_name='matrix_based_opt_buffers',
+            default_skip_embedding_weight_decay=default_skip_embedding_weight_decay,
+        )
+        if len(matrix_based_opt_param_groups) > 0:
+            optimizers.append(
+                _get_megatron_optimizer_based_on_param_groups(
+                    config,
+                    model_chunks=dense_model_chunks,
+                    param_groups=matrix_based_opt_param_groups,
+                    per_model_buffers=matrix_based_opt_buffers,
+                    model_parallel_group=mp_group,
+                    data_parallel_group=intra_dp_cp_group,
+                    data_parallel_group_gloo=intra_dp_cp_group_gloo,
+                    data_parallel_group_idx=model_parallel_rank,
+                    distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+                )
+            )
         model_chunk_offset += 1
 
     moe_param_groups, moe_buffers = _get_param_groups_and_buffers(
@@ -710,7 +886,7 @@ def get_megatron_optimizer(
         no_weight_decay_cond=no_weight_decay_cond,
         scale_lr_cond=scale_lr_cond,
         lr_mult=lr_mult,
-        filter_fn=lambda g: g['is_expert_parallel'],
+        filter_fn=lambda g: g['is_expert_parallel'] and not is_matrix_based_optim_group(g),
         buffer_name='expert_parallel_buffers',
         default_skip_embedding_weight_decay=default_skip_embedding_weight_decay,
     )
@@ -727,6 +903,38 @@ def get_megatron_optimizer(
                 model_chunks=model_chunks,
                 param_groups=moe_param_groups,
                 per_model_buffers=moe_buffers,
+                model_parallel_group=expt_tp_pp_group,
+                data_parallel_group=intra_expt_dp_group,
+                data_parallel_group_gloo=expt_data_parallel_group_gloo,
+                data_parallel_group_idx=expt_model_parallel_rank,
+                distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+            )
+        )
+
+    moe_matrix_based_opt_param_groups, moe_matrix_based_opt_buffers = _get_param_groups_and_buffers(
+        model_chunks,
+        model_chunk_offset=0,
+        config=config,
+        no_weight_decay_cond=no_weight_decay_cond,
+        scale_lr_cond=scale_lr_cond,
+        lr_mult=lr_mult,
+        filter_fn=lambda g: g['is_expert_parallel'] and is_matrix_based_optim_group(g),
+        buffer_name='matrix_based_opt_expert_parallel_buffers',
+        default_skip_embedding_weight_decay=default_skip_embedding_weight_decay,
+    )
+    if len(moe_matrix_based_opt_param_groups) > 0:
+        expt_model_parallel_rank = get_pg_rank(expt_tp_pp_group)
+        # Pass Gloo process groups into optimizer only if needed.
+        if use_gloo_process_groups:
+            expt_data_parallel_group_gloo = intra_expt_dp_group_gloo
+        else:
+            expt_data_parallel_group_gloo = None
+        optimizers.append(
+            _get_megatron_optimizer_based_on_param_groups(
+                config,
+                model_chunks=model_chunks,
+                param_groups=moe_matrix_based_opt_param_groups,
+                per_model_buffers=moe_matrix_based_opt_buffers,
                 model_parallel_group=expt_tp_pp_group,
                 data_parallel_group=intra_expt_dp_group,
                 data_parallel_group_gloo=expt_data_parallel_group_gloo,
