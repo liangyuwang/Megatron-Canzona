@@ -1261,13 +1261,14 @@ class DistMatrixBasedOptimizer(DistributedOptimizer, MixedPrecisionOptimizer):
                     if isinstance(sharded_metadata, ShardedTensorFactory):
                         state_sharded_metadata = sharded_metadata.build()[0]
 
-                    if len(state_sharded_metadata.global_offset) == 3:
-                        global_offset = state_sharded_metadata.global_offset[:-1]
+                    prepend_axis_num = state_sharded_metadata.prepend_axis_num
+                    if prepend_axis_num > 0:
+                        global_offset = state_sharded_metadata.global_offset[:prepend_axis_num] + (0,)
                     else:
                         global_offset = (0,)
 
-                    if len(state_sharded_metadata.axis_fragmentations) == 3:
-                        axis_fragmentations = (state_sharded_metadata.axis_fragmentations[0], 1)
+                    if len(state_sharded_metadata.axis_fragmentations) == prepend_axis_num + 2:
+                        axis_fragmentations = state_sharded_metadata.axis_fragmentations[:prepend_axis_num] + (1,)
                     else:
                         axis_fragmentations = (1,)
 
@@ -1276,7 +1277,7 @@ class DistMatrixBasedOptimizer(DistributedOptimizer, MixedPrecisionOptimizer):
                         assert dim * dim == state_ten.numel(), (
                             f'for {state_key=} {state_ten.numel()=} {dim=}'
                         )
-                    
+
                     if not self.optimizer.param_groups[group_index]['is_tensor_parallel']:
                         matrix_replica_id = (0, sharded_metadata.replica_id[1], 0)
                     else:
