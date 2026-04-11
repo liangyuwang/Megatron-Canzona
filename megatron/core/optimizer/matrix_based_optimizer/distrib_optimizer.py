@@ -663,7 +663,10 @@ class DistMatrixBasedOptimizer(DistributedOptimizer, MixedPrecisionOptimizer):
             self.optimizer.load_state_dict(self.optimizer.state_dict())
         
         # Build param_to_tp_rank_map for async TP state allocation
-        self._build_param_to_tp_rank_map()
+        from megatron.training import get_args
+        args = get_args()
+        if args.use_tp_async_opt:
+            self._build_param_to_tp_rank_map()
 
     def _build_param_to_tp_rank_map(self):
         """
@@ -1215,6 +1218,8 @@ class DistMatrixBasedOptimizer(DistributedOptimizer, MixedPrecisionOptimizer):
         state = {}
 
         def _get_param_state_sharded_tensors(model_param, item_slice):
+            group_index, group_order = self.model_param_group_index_map[model_param]
+            
             # Main param & optimizer states.
             tensors = self._get_main_param_and_optimizer_states(model_param)
             tensors["fp32_param"] = tensors.pop("param")

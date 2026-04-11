@@ -16,10 +16,6 @@ except:
     dist_all_gather_func = torch.distributed._all_gather_base
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
-from megatron.core.fp8_utils import (
-    is_float8tensor,
-    post_all_gather_processing,
-)
 from ...distributed.param_and_grad_buffer import (
     _ParamAndGradBucketGroup, 
     _ParamAndGradBuffer,

@@ -188,7 +188,12 @@ def _get_param_groups(
         }
         # Ensure param_group has required keys for matching when loading optimizer state
         # See MegatronOptimizer._filter_and_reorder_param_groups.
-        assert set(param_group.keys()) - set(param_group_identifier_keys) == {'params'}
+        assert set(param_group.keys()) - set(param_group_identifier_keys) == {
+            'params', 
+            'is_tensor_parallel', 
+            'use_muon', 
+            'use_soap'
+        }
         param_groups.append(param_group)
 
     param_groups = _update_min_and_max_lr_in_param_groups(
