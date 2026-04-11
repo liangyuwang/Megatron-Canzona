@@ -346,12 +346,13 @@ def _get_megatron_optimizer_based_on_param_groups(
         # due to CANZONA, tp_size is always 1, but we keep the logic here for clarity and future extension when CANZONA is not used
         tp_size = 1
         if args.matrix_based_optimizer_split_qkv:
+            attn_output_gate = getattr(args, 'attn_output_gate', False)
             if args.matrix_based_optimizer_split_qkv_per_head:
-                qkv_shape = [args.kv_channels, args.attention_output_gate + 1]
+                qkv_shape = [args.kv_channels, attn_output_gate + 1]
                 split_matrix_based_optimizer_shape_map['is_full_attn_qkv'] = qkv_shape
                 split_matrix_based_optimizer_shape_map['is_full_attn_qkv_num_heads'] = [args.num_attention_heads // tp_size, args.num_query_groups // tp_size]
             else:
-                qkv_shape = [args.kv_channels, args.num_attention_heads // tp_size, args.num_query_groups // tp_size, args.attention_output_gate + 1]
+                qkv_shape = [args.kv_channels, args.num_attention_heads // tp_size, args.num_query_groups // tp_size, args.attn_output_gate + 1]
                 split_matrix_based_optimizer_shape_map['is_full_attn_qkv'] = qkv_shape
         if args.matrix_based_optimizer_split_fc1:
             assert args.swiglu, 'Only swiglu need to split linear_fc1'
