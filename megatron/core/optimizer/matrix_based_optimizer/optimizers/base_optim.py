@@ -73,6 +73,10 @@ class BaseOptim(torch.optim.Optimizer):
             return self.step_with_cuda_graph(loss)
         
         for group in self.param_groups:
+            # Increment step counter to stay consistent with TE FusedAdam.
+            # _synchronize_steps() in ChainedOptimizer relies on this for
+            # cross-optimizer step alignment.
+            group["step"] = group.get("step", 0) + 1
             if 'origin_shape' not in group:
                 shapes_map = {p: {'origin_shape': p.shape} for p in group['params']}
                 shapes = [p.shape for p in group['params']] # compatible with no dist-optim
@@ -99,6 +103,7 @@ class BaseOptim(torch.optim.Optimizer):
 
     def step_with_cuda_graph(self, loss):
         for i, group in enumerate(self.param_groups):
+            group["step"] = group.get("step", 0) + 1
             if 'origin_shape' not in group:
                 shapes = [p.shape for p in group['params']]
             else:
