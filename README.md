@@ -1,5 +1,21 @@
 <div align="center">
 
+Megatron-Canzona
+================
+<h4>Unified, asynchronous, and load-balanced matrix-based optimization for large-scale distributed training</h4>
+
+**Supported optimizers:** **Muon** · **SOAP** · *Extensible via plugin API*
+
+> **Paper:** [Canzona](https://arxiv.org/abs/2602.06079)
+> Evaluated on Qwen3 models (up to 32B parameters) on 256 GPUs: **1.57x speedup** in end-to-end iteration time, **5.8x reduction** in optimizer step latency.
+
+- **[Canzona Developer Guide](megatron/core/optimizer/matrix_based_optimizer/README.md)** — architecture, usage, and configuration for matrix-based optimizers (Muon, SOAP).
+- **[Adding a New Optimizer](megatron/core/optimizer/matrix_based_optimizer/optimizers/README.md)** — step-by-step guide for integrating a custom matrix-based optimizer.
+
+![Canzona Overview](images/canzona-overview.png)
+
+---
+
 Megatron-LM & Megatron Core
 ===========================
 <h4>GPU-optimized library for training transformer models at scale</h4>
