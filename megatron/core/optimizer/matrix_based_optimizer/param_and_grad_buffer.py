@@ -32,6 +32,38 @@ class _MatrixBasedParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         super().__init__(*args, **kwargs)
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             raise NotImplementedError
+        self._buckets_classified = False
+        self.even_buckets = []
+        self.uneven_buckets = []
+
+    def _classify_buckets(self):
+        if self._buckets_classified:
+            return
+        
+        has_attr = [hasattr(obj, 'real_gbuf_world_ranges') for obj in self.buckets]
+        assert all(has_attr), "'dp buckets' elements must have 'real_gbuf_world_ranges' attribute"
+        
+        self.even_buckets = []
+        self.uneven_buckets = []
+        for bucket in self.buckets:
+            even_shard = len(set([r.end - r.start for r in bucket.real_gbuf_world_ranges])) == 1
+            if even_shard:
+                self.even_buckets.append(bucket)
+            else:
+                self.uneven_buckets.append(bucket)
+        
+        from megatron.core.utils import log_on_each_pipeline_stage
+        buffer_name = self.buckets[0].buffer_name
+        log_on_each_pipeline_stage(
+            logger,
+            logging.INFO,
+            f"DP Bucket classification [{buffer_name}]: "
+            f"{len(self.even_buckets)} even bucket(s), "
+            f"{len(self.uneven_buckets)} uneven bucket(s) "
+            f"(total: {len(self.buckets)})"
+        )
+        
+        self._buckets_classified = True
 
     def start_param_sync(self, force_sync: bool = False):
         """
@@ -58,35 +90,27 @@ class _MatrixBasedParamAndGradBucketGroup(_ParamAndGradBucketGroup):
 
         async_op = self.ddp_config.overlap_param_gather and not force_sync
         
-        self.matrix_based_opt_buffer = self.ddp_config.use_matrix_based_optimizer and hasattr(self.buckets[0], 'real_gbuf_world_ranges')
-        has_attr = [hasattr(obj, 'real_gbuf_world_ranges') for obj in self.buckets]
-        assert all(has_attr) or not any(has_attr), "List elements must either all have 'real_gbuf_world_ranges' attribute or all not have it"
-        if self.matrix_based_opt_buffer:
-            device = self.buckets[0].param_data.device
-            with _coalescing_manager(self.data_parallel_group, device=device, async_ops=async_op) as cm:
-                for bucket in self.buckets:
-                    total_data_view = [bucket.param_data[r.start - bucket.offset: r.end - bucket.offset] for r in bucket.real_gbuf_world_ranges]
-                    local_data_view = bucket.param_data[bucket.real_gbuf_world_ranges[self.data_parallel_rank].start - bucket.offset : bucket.real_gbuf_world_ranges[self.data_parallel_rank].end - bucket.offset]
-                    coalesced_allgather(total_data_view, local_data_view, self.data_parallel_group, async_op)
-        else:
-            # Coalesce communication kernels across buckets in the bucket group.
-            with _coalescing_manager(
-                self.intra_distributed_optimizer_instance_group, async_ops=async_op
-            ) as cm:
-                for idx, bucket in enumerate(self.buckets):
-                    if self.cached_param_buffer_shard_list[idx] is None:
-                        self.cached_param_buffer_shard_list[idx] = shard_buffer(
-                            bucket.param_data, self.intra_distributed_optimizer_instance_size
-                        )
-                    local_data_view = self.cached_param_buffer_shard_list[idx][
-                        self.intra_distributed_optimizer_instance_rank
-                    ]
-                    dist_all_gather_func(
-                        bucket.param_data,
-                        local_data_view,
-                        group=self.intra_distributed_optimizer_instance_group,
-                        async_op=async_op,
+        device = self.buckets[0].param_data.device
+        self._classify_buckets()
+        with _coalescing_manager(self.intra_distributed_optimizer_instance_group, device=device, async_ops=async_op) as cm:
+            for bucket in self.uneven_buckets:
+                total_data_view = [bucket.param_data[r.start - bucket.offset: r.end - bucket.offset] for r in bucket.real_gbuf_world_ranges]
+                local_data_view = bucket.param_data[bucket.real_gbuf_world_ranges[self.data_parallel_rank].start - bucket.offset : bucket.real_gbuf_world_ranges[self.data_parallel_rank].end - bucket.offset]
+                coalesced_allgather(total_data_view, local_data_view, self.intra_distributed_optimizer_instance_group, async_op)
+            for idx, bucket in enumerate(self.even_buckets):
+                if self.cached_param_buffer_shard_list[idx] is None:
+                    self.cached_param_buffer_shard_list[idx] = shard_buffer(
+                        bucket.param_data, self.intra_distributed_optimizer_instance_size
                     )
+                local_data_view = self.cached_param_buffer_shard_list[idx][
+                    self.intra_distributed_optimizer_instance_rank
+                ]
+                dist_all_gather_func(
+                    bucket.param_data,
+                    local_data_view,
+                    group=self.intra_distributed_optimizer_instance_group,
+                    async_op=async_op,
+                )
         if async_op:
             self.param_gather_handle = cm
         else:
@@ -216,51 +240,40 @@ class _MatrixBasedParamAndGradBucketGroup(_ParamAndGradBucketGroup):
 
         data_parallel_rank = torch.distributed.get_rank(group=communication_group)
 
-        use_matrix_based_optimizer = (
-            self.ddp_config.use_distributed_optimizer
-            and self.ddp_config.use_matrix_based_optimizer
-            and hasattr(self.buckets[0], 'real_gbuf_world_ranges')
-        )
-        perform_non_uniform_reduce_scatter = use_matrix_based_optimizer
-        if perform_non_uniform_reduce_scatter:
-            has_attr = [hasattr(obj, 'real_gbuf_world_ranges') for obj in self.buckets]
-            assert all(has_attr), "All buckets must have 'real_gbuf_world_ranges' in matrix mode."
-            device = self.buckets[0].grad_data.device
-            with stream_context, _coalescing_manager(communication_group, device=device, async_ops=async_op) as cm:
-                for bucket in self.buckets:
-                    # TODO: Verify compatibility with Hybrid DDP (Intra-group ReduceScatter).
-                    # Issue: If `real_gbuf_world_ranges` contains ranges for the GLOBAL world size 
-                    # (e.g., 16 ranks) but we are currently performing an INTRA-group RS 
-                    # (e.g., group size 8), `total_data_view` will have length 16.
-                    # PyTorch's `reduce_scatter` will throw an error if input list length != group size.
-                    # Fix: If this is the case, we need to slice `bucket.real_gbuf_world_ranges` 
-                    # to only include the ranges corresponding to the current intra-group ranks.
-                    total_data_view = [bucket.grad_data[r.start - bucket.offset: r.end - bucket.offset] for r in bucket.real_gbuf_world_ranges]
-                    local_data_view = bucket.grad_data[bucket.real_gbuf_world_ranges[self.data_parallel_rank].start - bucket.offset : bucket.real_gbuf_world_ranges[self.data_parallel_rank].end - bucket.offset]
-                    coalesced_reduce_scatter(local_data_view, total_data_view, self.data_parallel_group, reduce_op, async_op)
-        else:
-            # Coalesce communication kernels across buckets in the bucket group.
-            with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
-                for idx, bucket in enumerate(self.buckets):
-                    if self.ddp_config.use_distributed_optimizer:
-                        if self.cached_grad_buffer_shard_list[idx] is None:
-                            self.cached_grad_buffer_shard_list[idx] = shard_buffer(
-                                bucket.grad_data, self.intra_distributed_optimizer_instance_size
-                            )
-                        local_data_view = self.cached_grad_buffer_shard_list[idx][
-                            self.intra_distributed_optimizer_instance_rank
-                        ]
-                        dist_reduce_scatter_func(
-                            local_data_view,
-                            bucket.grad_data,
-                            op=reduce_op,
-                            group=communication_group,
-                            async_op=async_op,
+        device = self.buckets[0].grad_data.device
+        self._classify_buckets()
+        with stream_context, _coalescing_manager(communication_group, device=device, async_ops=async_op) as cm:
+            for bucket in self.uneven_buckets:
+                # TODO: Verify compatibility with Hybrid DDP (Intra-group ReduceScatter).
+                # Issue: If `real_gbuf_world_ranges` contains ranges for the GLOBAL world size 
+                # (e.g., 16 ranks) but we are currently performing an INTRA-group RS 
+                # (e.g., group size 8), `total_data_view` will have length 16.
+                # PyTorch's `reduce_scatter` will throw an error if input list length != group size.
+                # Fix: If this is the case, we need to slice `bucket.real_gbuf_world_ranges` 
+                # to only include the ranges corresponding to the current intra-group ranks.
+                total_data_view = [bucket.grad_data[r.start - bucket.offset: r.end - bucket.offset] for r in bucket.real_gbuf_world_ranges]
+                local_data_view = bucket.grad_data[bucket.real_gbuf_world_ranges[self.data_parallel_rank].start - bucket.offset : bucket.real_gbuf_world_ranges[self.data_parallel_rank].end - bucket.offset]
+                coalesced_reduce_scatter(local_data_view, total_data_view, self.data_parallel_group, reduce_op, async_op)
+            for idx, bucket in enumerate(self.even_buckets):
+                if self.ddp_config.use_distributed_optimizer:
+                    if self.cached_grad_buffer_shard_list[idx] is None:
+                        self.cached_grad_buffer_shard_list[idx] = shard_buffer(
+                            bucket.grad_data, self.intra_distributed_optimizer_instance_size
                         )
-                    else:
-                        torch.distributed.all_reduce(
-                            bucket.grad_data, op=reduce_op, group=communication_group, async_op=async_op
-                        )
+                    local_data_view = self.cached_grad_buffer_shard_list[idx][
+                        self.intra_distributed_optimizer_instance_rank
+                    ]
+                    dist_reduce_scatter_func(
+                        local_data_view,
+                        bucket.grad_data,
+                        op=reduce_op,
+                        group=communication_group,
+                        async_op=async_op,
+                    )
+                else:
+                    torch.distributed.all_reduce(
+                        bucket.grad_data, op=reduce_op, group=communication_group, async_op=async_op
+                    )
         if async_op:
             self.grad_reduce_handle = cm
         else:
@@ -285,7 +298,7 @@ class _MatrixBasedParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 ) as cm,
             ):
                 for idx, bucket in enumerate(self.buckets):
-                    if perform_non_uniform_reduce_scatter:
+                    if len(self.uneven_buckets) >= 1:
                         my_range = bucket.real_gbuf_world_ranges[self.intra_distributed_optimizer_instance_rank]
                         local_data_view = bucket.grad_data[
                             my_range.start - bucket.offset : my_range.end - bucket.offset
