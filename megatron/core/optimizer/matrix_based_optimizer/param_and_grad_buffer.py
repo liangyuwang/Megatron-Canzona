@@ -22,6 +22,8 @@ from ...distributed.param_and_grad_buffer import (
     shard_buffer,
 )
 
+from .comm_extension import coalesced_allgather, coalesced_reduce_scatter
+
 logger = logging.getLogger(__name__)
 
 
@@ -60,17 +62,12 @@ class _MatrixBasedParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         has_attr = [hasattr(obj, 'real_gbuf_world_ranges') for obj in self.buckets]
         assert all(has_attr) or not any(has_attr), "List elements must either all have 'real_gbuf_world_ranges' attribute or all not have it"
         if self.matrix_based_opt_buffer:
-            param_gather_works = []
-            for bucket in self.buckets:
-                total_data_view = [bucket.param_data[r.start - bucket.offset: r.end - bucket.offset] for r in bucket.real_gbuf_world_ranges]
-                local_data_view = bucket.param_data[bucket.real_gbuf_world_ranges[data_parallel_rank].start - bucket.offset : bucket.real_gbuf_world_ranges[data_parallel_rank].end - bucket.offset]
-                work = torch.distributed.all_gather(
-                    total_data_view,
-                    local_data_view,
-                    group=self.intra_distributed_optimizer_instance_group,
-                    async_op=async_op,
-                )
-                param_gather_works.append(work)
+            device = self.buckets[0].param_data.device
+            with _coalescing_manager(self.data_parallel_group, device=device, async_ops=async_op) as cm:
+                for bucket in self.buckets:
+                    total_data_view = [bucket.param_data[r.start - bucket.offset: r.end - bucket.offset] for r in bucket.real_gbuf_world_ranges]
+                    local_data_view = bucket.param_data[bucket.real_gbuf_world_ranges[self.data_parallel_rank].start - bucket.offset : bucket.real_gbuf_world_ranges[self.data_parallel_rank].end - bucket.offset]
+                    coalesced_allgather(total_data_view, local_data_view, self.data_parallel_group, async_op)
         else:
             # Coalesce communication kernels across buckets in the bucket group.
             with _coalescing_manager(
@@ -90,10 +87,8 @@ class _MatrixBasedParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                         group=self.intra_distributed_optimizer_instance_group,
                         async_op=async_op,
                     )
-        if async_op and not self.matrix_based_opt_buffer:
+        if async_op:
             self.param_gather_handle = cm
-        elif async_op and self.matrix_based_opt_buffer:
-            self.param_gather_handle = param_gather_works
         else:
             # When using `_coalescing_manager`, even if a synchronous op (async_op=False) is used,
             # `cm` is not None, which is different from when `_coalescing_manager` is not used in
@@ -127,11 +122,7 @@ class _MatrixBasedParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             self.start_param_sync()
 
         if self.param_gather_handle is not None:
-            if isinstance(self.param_gather_handle, list):
-                for handle in self.param_gather_handle:
-                    handle.wait()
-            else:
-                self.param_gather_handle.wait()
+            self.param_gather_handle.wait()
             self.param_gather_handle = None
             # Dispatch next bucket's asynchronous param AG only if it has not been dispatched yet.
             if self.next_param_gather_bucket_group is not None and not skip_next_bucket_dispatch:
@@ -234,10 +225,8 @@ class _MatrixBasedParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         if perform_non_uniform_reduce_scatter:
             has_attr = [hasattr(obj, 'real_gbuf_world_ranges') for obj in self.buckets]
             assert all(has_attr), "All buckets must have 'real_gbuf_world_ranges' in matrix mode."
-
-            grad_reduce_works = []
-            
-            with stream_context:
+            device = self.buckets[0].grad_data.device
+            with stream_context, _coalescing_manager(communication_group, device=device, async_ops=async_op) as cm:
                 for bucket in self.buckets:
                     # TODO: Verify compatibility with Hybrid DDP (Intra-group ReduceScatter).
                     # Issue: If `real_gbuf_world_ranges` contains ranges for the GLOBAL world size 
@@ -246,30 +235,9 @@ class _MatrixBasedParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                     # PyTorch's `reduce_scatter` will throw an error if input list length != group size.
                     # Fix: If this is the case, we need to slice `bucket.real_gbuf_world_ranges` 
                     # to only include the ranges corresponding to the current intra-group ranks.
-                    total_data_view = [
-                        bucket.grad_data[r.start - bucket.offset : r.end - bucket.offset] 
-                        for r in bucket.real_gbuf_world_ranges
-                    ]
-                    local_data_view = bucket.grad_data[
-                        bucket.real_gbuf_world_ranges[data_parallel_rank].start - bucket.offset : 
-                        bucket.real_gbuf_world_ranges[data_parallel_rank].end - bucket.offset
-                    ]
-                    
-                    work = torch.distributed.reduce_scatter(
-                        local_data_view,
-                        total_data_view,
-                        op=reduce_op,
-                        group=communication_group,
-                        async_op=async_op
-                    )
-                    if async_op:
-                        grad_reduce_works.append(work)
-
-            if async_op:
-                self.grad_reduce_handle = grad_reduce_works
-            else:
-                self.grad_reduce_handle = None
-            
+                    total_data_view = [bucket.grad_data[r.start - bucket.offset: r.end - bucket.offset] for r in bucket.real_gbuf_world_ranges]
+                    local_data_view = bucket.grad_data[bucket.real_gbuf_world_ranges[self.data_parallel_rank].start - bucket.offset : bucket.real_gbuf_world_ranges[self.data_parallel_rank].end - bucket.offset]
+                    coalesced_reduce_scatter(local_data_view, total_data_view, self.data_parallel_group, reduce_op, async_op)
         else:
             # Coalesce communication kernels across buckets in the bucket group.
             with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
@@ -293,15 +261,15 @@ class _MatrixBasedParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                         torch.distributed.all_reduce(
                             bucket.grad_data, op=reduce_op, group=communication_group, async_op=async_op
                         )
-            if async_op:
-                self.grad_reduce_handle = cm
-            else:
-                # When using `_coalescing_manager`, even if a synchronous op (async_op=False) is used,
-                # `cm` is not None, which is different from when `_coalescing_manager` is not used in
-                # which case the torch.distributed._reduce_scatter_base() will return None. In order to
-                # maintain consistency with prior code, we need to manually set communication handle to
-                # None.
-                self.grad_reduce_handle = None
+        if async_op:
+            self.grad_reduce_handle = cm
+        else:
+            # When using `_coalescing_manager`, even if a synchronous op (async_op=False) is used,
+            # `cm` is not None, which is different from when `_coalescing_manager` is not used in
+            # which case the torch.distributed._reduce_scatter_base() will return None. In order to
+            # maintain consistency with prior code, we need to manually set communication handle to
+            # None.
+            self.grad_reduce_handle = None
 
         # With multiple DistOpt instances, we need to all-reduce across instances.
         if (
@@ -365,11 +333,7 @@ class _MatrixBasedParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             f"({len(self.params_with_grad)}/{len(self.params)} params have grad available)"
         )
         if self.grad_reduce_handle is not None:
-            if isinstance(self.grad_reduce_handle, list):
-                for handle in self.grad_reduce_handle:
-                    handle.wait()
-            else:
-                self.grad_reduce_handle.wait()
+            self.grad_reduce_handle.wait()
         self.grad_reduce_handle = None
 
 
