@@ -38,6 +38,9 @@ class _MatrixBasedParamAndGradBucketGroup(_ParamAndGradBucketGroup):
 
     def _classify_buckets(self):
         if self._buckets_classified:
+            if self.ddp_config.use_distributed_optimizer:
+                self.even_buckets = self.buckets
+                self._buckets_classified = True
             return
         
         has_attr = [hasattr(obj, 'real_gbuf_world_ranges') for obj in self.buckets]
@@ -95,7 +98,7 @@ class _MatrixBasedParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         with _coalescing_manager(self.intra_distributed_optimizer_instance_group, device=device, async_ops=async_op) as cm:
             for bucket in self.uneven_buckets:
                 total_data_view = [bucket.param_data[r.start - bucket.offset: r.end - bucket.offset] for r in bucket.real_gbuf_world_ranges]
-                local_data_view = bucket.param_data[bucket.real_gbuf_world_ranges[self.data_parallel_rank].start - bucket.offset : bucket.real_gbuf_world_ranges[self.data_parallel_rank].end - bucket.offset]
+                local_data_view = bucket.param_data[bucket.real_gbuf_world_ranges[data_parallel_rank].start - bucket.offset : bucket.real_gbuf_world_ranges[data_parallel_rank].end - bucket.offset]
                 coalesced_allgather(total_data_view, local_data_view, self.intra_distributed_optimizer_instance_group, async_op)
             for idx, bucket in enumerate(self.even_buckets):
                 if self.cached_param_buffer_shard_list[idx] is None:
@@ -252,7 +255,7 @@ class _MatrixBasedParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 # Fix: If this is the case, we need to slice `bucket.real_gbuf_world_ranges` 
                 # to only include the ranges corresponding to the current intra-group ranks.
                 total_data_view = [bucket.grad_data[r.start - bucket.offset: r.end - bucket.offset] for r in bucket.real_gbuf_world_ranges]
-                local_data_view = bucket.grad_data[bucket.real_gbuf_world_ranges[self.data_parallel_rank].start - bucket.offset : bucket.real_gbuf_world_ranges[self.data_parallel_rank].end - bucket.offset]
+                local_data_view = bucket.grad_data[bucket.real_gbuf_world_ranges[data_parallel_rank].start - bucket.offset : bucket.real_gbuf_world_ranges[data_parallel_rank].end - bucket.offset]
                 coalesced_reduce_scatter(local_data_view, total_data_view, self.data_parallel_group, reduce_op, async_op)
             for idx, bucket in enumerate(self.even_buckets):
                 if self.ddp_config.use_distributed_optimizer:
