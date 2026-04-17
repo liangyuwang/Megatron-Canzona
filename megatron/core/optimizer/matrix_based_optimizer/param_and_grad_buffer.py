@@ -37,10 +37,11 @@ class _MatrixBasedParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         self.uneven_buckets = []
 
     def _classify_buckets(self):
+        if not self.ddp_config.use_distributed_optimizer:
+            self.even_buckets = self.buckets
+            self._buckets_classified = True
+
         if self._buckets_classified:
-            if self.ddp_config.use_distributed_optimizer:
-                self.even_buckets = self.buckets
-                self._buckets_classified = True
             return
         
         has_attr = [hasattr(obj, 'real_gbuf_world_ranges') for obj in self.buckets]
