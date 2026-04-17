@@ -257,7 +257,7 @@ class _MatrixBasedParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 # to only include the ranges corresponding to the current intra-group ranks.
                 total_data_view = [bucket.grad_data[r.start - bucket.offset: r.end - bucket.offset] for r in bucket.real_gbuf_world_ranges]
                 local_data_view = bucket.grad_data[bucket.real_gbuf_world_ranges[data_parallel_rank].start - bucket.offset : bucket.real_gbuf_world_ranges[data_parallel_rank].end - bucket.offset]
-                coalesced_reduce_scatter(local_data_view, total_data_view, self.data_parallel_group, reduce_op, async_op)
+                coalesced_reduce_scatter(local_data_view, total_data_view, self.intra_distributed_optimizer_instance_group, reduce_op, async_op)
             for idx, bucket in enumerate(self.even_buckets):
                 if self.ddp_config.use_distributed_optimizer:
                     if self.cached_grad_buffer_shard_list[idx] is None:
