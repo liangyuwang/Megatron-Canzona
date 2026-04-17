@@ -1,12 +1,14 @@
 import os
-import torch
-from typing import List, Tuple, Dict, Union, Callable
+import logging
+from typing import List, Tuple, Dict, Callable
 
 from megatron.training import get_args
+from megatron.core.utils import log_on_each_pipeline_stage
 from .utils import (
     get_optim_memory_from_param, get_optim_flops_from_param,
-    log_to_file
 )
+
+logger = logging.getLogger(__name__)
 
 def get_balance_ratio(arr: list[int]) -> float:
     if sum(arr) == 0:
@@ -211,7 +213,10 @@ def visual_global_rank_loads(buckets_params_range_map: dict, buckets_slices_pos:
             loads[r] += br[r]
     return loads
 
-def print_bucket_slice_bars(
+def _log(msg: str) -> None:
+    log_on_each_pipeline_stage(logger, logging.INFO, msg)
+
+def log_bucket_slice_bars(
     buckets_params_range_map: List[Dict],
     buckets_slices_pos: List[List[int]],
     dp_size: int,
@@ -226,7 +231,7 @@ def print_bucket_slice_bars(
     - The length of each number segment shows the proportion of the bucket assigned to that rank.
     """
     if title:
-        print(f"\n== {title} ==")
+        _log(f"\n== {title} ==")
 
     # Total numel of each bucket is the last slice position.
     totals = [bsp[-1] for bsp in buckets_slices_pos]
@@ -244,13 +249,13 @@ def print_bucket_slice_bars(
 
         if n_params == 0 or scaled_len == 0:
             bar = " " * width
-            print(f"bucket {b_id:2d} |{bar}| {total} ({_human(total)})  n={n_params}")
+            _log(f"bucket {b_id:2d} |{bar}| {total} ({_human(total)})  n={n_params}")
             continue
 
         slice_pos = buckets_slices_pos[b_id]
         if len(slice_pos) != dp_size + 1:
             bar = "[Invalid Slicing Info]" + " " * (width - 25)
-            print(f"bucket {b_id:2d} |{bar}| {total} ({_human(total)})  n={n_params}")
+            _log(f"bucket {b_id:2d} |{bar}| {total} ({_human(total)})  n={n_params}")
             continue
 
         rank_segment_sizes = [slice_pos[r+1] - slice_pos[r] for r in range(dp_size)]
@@ -264,19 +269,19 @@ def print_bucket_slice_bars(
         segmented_bar = "".join(pieces)
         bar = segmented_bar + " " * (width - len(segmented_bar))
 
-        print(f"bucket {b_id:2d} |{bar}| {total} ({_human(total)})  n={n_params}")
+        _log(f"bucket {b_id:2d} |{bar}| {total} ({_human(total)})  n={n_params}")
 
-def print_rank_bars(loads: List[int], title: str = "", width: int = 48) -> None:
+def log_rank_bars(loads: List[int], title: str = "", width: int = 48) -> None:
     if title:
-        print(f"\n== {title} ==")
+        _log(f"\n== {title} ==")
     obj = compute_objectives(loads)
     br = get_balance_ratio(loads)
     mx = max(loads) if loads else 0
     mu = obj["mean"]
-    print(f"total={_human(int(obj['total']))}  mean={_human(int(mu))}  "
+    _log(f"total={_human(int(obj['total']))}  mean={_human(int(mu))}  "
           f"max={_human(int(mx))}  balance_ratio={br:.4f}  variance={obj['variance']:.2f}")
     for r, L in enumerate(loads):
-        print(f"rank {r:2d} |{_bar(L, mx, width=width)}| {L} ({_human(L)})")
+        _log(f"rank {r:2d} |{_bar(L, mx, width=width)}| {L} ({_human(L)})")
 
 def visualize_stage(
     buckets_params_range_map,
@@ -284,20 +289,18 @@ def visualize_stage(
     dp_size: int,
     stage: str,
 ):
-    print("\n" + "=" * 80)
-    print(f"[{stage}]")
-    print("=" * 80)
+    _log("\n" + "=" * 80)
+    _log(f"[{stage}]")
+    _log("=" * 80)
 
-    loads = global_rank_loads(buckets_params_range_map, buckets_slices_pos, dp_size)
+    log_bucket_slice_bars(buckets_params_range_map, buckets_slices_pos, dp_size, title=f"{stage}: Bucket DP Slicing")
 
-    print_bucket_slice_bars(buckets_params_range_map, buckets_slices_pos, dp_size, title=f"{stage}: Bucket DP Slicing")
-    
     cost_fn_mem = get_balance_cost_fn("numel")
     cost_fn_flops = get_balance_cost_fn("flops")
     loads_mem = visual_global_rank_loads(buckets_params_range_map, buckets_slices_pos, dp_size, cost_fn_mem)
-    print_rank_bars(loads_mem, title=f"{stage}: DP Rank Memory Load")
+    log_rank_bars(loads_mem, title=f"{stage}: DP Rank Memory Load")
     loads_flops = visual_global_rank_loads(buckets_params_range_map, buckets_slices_pos, dp_size, cost_fn_flops)
-    print_rank_bars(loads_flops, title=f"{stage}: DP Rank FLOPs Load")
+    log_rank_bars(loads_flops, title=f"{stage}: DP Rank FLOPs Load")
 
 
 
@@ -313,13 +316,10 @@ def build_dp_load_balanced_dist_opt_buffer_slices_pos(
     args = get_args()
     balance_cost_name = args.dp_balanced_opt_cost
     log_visualization = args.dp_balanced_opt_log_visualization
-    log_visualization_path = args.dp_balanced_opt_log_path
     dp_balanced_opt_alpha = args.dp_balanced_opt_alpha
 
     global dp_balance_cost
     dp_balance_cost = get_balance_cost_fn(balance_cost_name)
-    if log_visualization:
-        log_visualization_path = os.path.join(log_visualization_path, "dp_load_balanced_opt.log")
 
     buckets_params_range_map = []
     buckets_dp_slices_pos = []
@@ -338,19 +338,18 @@ def build_dp_load_balanced_dist_opt_buffer_slices_pos(
     loads = global_rank_loads(buckets_params_range_map, buckets_dp_slices_pos, dp_size)
     buckets_balance_ratio = get_balance_ratio(loads)
     if log_visualization:
-        with log_to_file(log_visualization_path, enable=log_visualization):
-            visualize_stage(
-                buckets_params_range_map=buckets_params_range_map,
-                buckets_slices_pos=buckets_dp_slices_pos,
-                dp_size=dp_size,
-                stage=f"BEFORE Greedy LPT",
-            )
-            for i, _ in enumerate(buckets_dp_slices_pos):
-                print(f"bucket {i}'s slices position: {buckets_dp_slices_pos[i]}")
-            print(f"dp balance ratio: {get_balance_ratio(loads):.6}")
-            for bucket_idx, bsp in enumerate(buckets_dp_slices_pos):
-                print(f"bucket {bucket_idx} comm balance ratio: "
-                    f"{get_balance_ratio([bsp[r+1] - bsp[r] for r in range(dp_size)]):.6}")
+        visualize_stage(
+            buckets_params_range_map=buckets_params_range_map,
+            buckets_slices_pos=buckets_dp_slices_pos,
+            dp_size=dp_size,
+            stage=f"BEFORE Greedy LPT",
+        )
+        for i, _ in enumerate(buckets_dp_slices_pos):
+            print(f"bucket {i}'s slices position: {buckets_dp_slices_pos[i]}")
+        print(f"dp balance ratio: {get_balance_ratio(loads):.6}")
+        for bucket_idx, bsp in enumerate(buckets_dp_slices_pos):
+            print(f"bucket {bucket_idx} comm balance ratio: "
+                f"{get_balance_ratio([bsp[r+1] - bsp[r] for r in range(dp_size)]):.6}")
 
     real_bucket_totals = [slices[-1] for slices in buckets_dp_slices_pos]
 
@@ -365,19 +364,18 @@ def build_dp_load_balanced_dist_opt_buffer_slices_pos(
     loads = global_rank_loads(buckets_params_range_map, new_buckets_dp_slices_pos, dp_size)
     new_buckets_balance_ratio = get_balance_ratio(loads)
     if log_visualization:
-        with log_to_file(log_visualization_path, enable=log_visualization):
-            visualize_stage(
-                buckets_params_range_map=buckets_params_range_map,
-                buckets_slices_pos=new_buckets_dp_slices_pos,
-                dp_size=dp_size,
-                stage=f"AFTER Greedy LPT",
-            )
-            for i, _ in enumerate(new_buckets_dp_slices_pos):
-                print(f"new bucket {i}'s slices position: {new_buckets_dp_slices_pos[i]}")
-            print(f"dp balance ratio: {get_balance_ratio(loads):.6}")
-            for bucket_idx, bsp in enumerate(new_buckets_dp_slices_pos):
-                print(f"bucket {bucket_idx} comm balance ratio: "
-                    f"{get_balance_ratio([bsp[r+1] - bsp[r] for r in range(dp_size)]):.6}")
+        visualize_stage(
+            buckets_params_range_map=buckets_params_range_map,
+            buckets_slices_pos=new_buckets_dp_slices_pos,
+            dp_size=dp_size,
+            stage=f"AFTER Greedy LPT",
+        )
+        for i, _ in enumerate(new_buckets_dp_slices_pos):
+            print(f"new bucket {i}'s slices position: {new_buckets_dp_slices_pos[i]}")
+        print(f"dp balance ratio: {get_balance_ratio(loads):.6}")
+        for bucket_idx, bsp in enumerate(new_buckets_dp_slices_pos):
+            print(f"bucket {bucket_idx} comm balance ratio: "
+                f"{get_balance_ratio([bsp[r+1] - bsp[r] for r in range(dp_size)]):.6}")
 
     # Stick with the original plan if the new plan isn't strictly better
     if new_buckets_balance_ratio >= buckets_balance_ratio or int(os.environ.get('DEBUG_DP_BALANCED_OPT', 0)) == 1:

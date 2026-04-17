@@ -1,4 +1,5 @@
 import heapq
+import logging
 from typing import Tuple, Dict, List, Callable, Union
 from collections import OrderedDict
 import functools, operator
@@ -6,13 +7,12 @@ import copy
 import random
 import math
 import os
-import sys
-from contextlib import contextmanager
 
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 
+from megatron.core.utils import log_on_each_pipeline_stage
 from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
@@ -21,7 +21,6 @@ from megatron.core.parallel_state import (
 
 from .utils import (
     get_optim_memory_from_param, get_optim_flops_from_param,
-    log_to_file
 )
 
 """
@@ -80,7 +79,6 @@ class AsyncGroupExecutor:
         self.max_numel_per_slot = int(args.tp_balanced_opt_fuse_space) * 1024 * 1024
         self.tp_cost_name = args.tp_balanced_opt_cost
         self.log_visualization = args.tp_balanced_opt_log_visualization
-        self.log_visualization_path = args.tp_balanced_opt_log_path
 
 
     def build_param_to_tp_rank_map(self, params, shapes):
@@ -123,13 +121,10 @@ class AsyncGroupExecutor:
 
         log_visualization = self.log_visualization
         if log_visualization and not initialized:
-            viz = TPLoadVisualizer(self.world_size, self.rank , self.cost_fn)
+            viz = TPLoadVisualizer(self.world_size, self.rank, self.cost_fn)
             no_balanced_micro_tp_groups = self.get_micro_param_groups("no", param_group['params'], shapes)
-            if log_visualization:
-                log_visualization_path = os.path.join(self.log_visualization_path, "tp_load_balanced_opt.log")
-            with log_to_file(log_visualization_path, enable=log_visualization):
-                viz.visualize(no_balanced_micro_tp_groups, title="TP No Load Balance Report")
-                viz.visualize(param_group["balanced_micro_tp_groups"], title=f"TP Load Balance Report, balance={self.balance}")
+            viz.visualize(no_balanced_micro_tp_groups, title="TP No Load Balance Report")
+            viz.visualize(param_group["balanced_micro_tp_groups"], title=f"TP Load Balance Report, balance={self.balance}")
 
         for idx, micro_param_group in enumerate(param_group["balanced_micro_tp_groups"]):
             micro_full_tensors_group = self.gather(
@@ -600,6 +595,11 @@ def get_numel_from_shape(shape):
 # ------- visual utility ---------
 # =================================
 
+logger = logging.getLogger(__name__)
+
+def _log(msg: str) -> None:
+    log_on_each_pipeline_stage(logger, logging.INFO, msg)
+
 class TPLoadVisualizer:
     def __init__(self, world_size, rank=0, cost_fn=None):
         self.world_size = world_size
@@ -650,7 +650,6 @@ class TPLoadVisualizer:
             raise ValueError
 
     def _get_color_by_load(self, load, max_load, min_load):
-        # ... (no changes) ...
         if max_load == min_load:
             return self.colors['green']
         ratio = (load - min_load) / (max_load - min_load + 1e-6)
@@ -666,11 +665,8 @@ class TPLoadVisualizer:
         """
         cost_fn_ = lambda p: self.cost_fn(p, cost_name)
 
-        if self.rank != 0:
-            return
-
-        print(f"\n=== {title} ===")
-        print(f"Total Micro Groups: {len(micro_param_groups)}\n")
+        _log(f"\n=== {title} ===")
+        _log(f"Total Micro Groups: {len(micro_param_groups)}\n")
 
         total_imbalance_params = 0
         total_params = 0
@@ -694,7 +690,7 @@ class TPLoadVisualizer:
             total_imbalance_params += (sum(rank_loads) - min_load * len(rank_loads))
 
             # 2. Print Group Header
-            print(f"Micro Group [{g_idx}] "
+            _log(f"Micro Group [{g_idx}] "
                 f"(Max Imbalance: {imbalance_ratio:.4f}x | "
                 f"Spread: {self._human_readable(cost_name, max_load - min_load)})")
 
@@ -706,16 +702,15 @@ class TPLoadVisualizer:
                 bar_str = self.bar_char * bar_len + self.empty_char * (max_bar_width - bar_len)
 
                 size_str = self._human_readable(cost_name, load)
-                print(f"  Rank {r_idx}: [{bar_str}] {size_str}")
-            print("-" * 60)
+                _log(f"  Rank {r_idx}: [{bar_str}] {size_str}")
+            _log("-" * 60)
 
-        print(f"Summary:")
-        print(f"  Total Processed: {self._human_readable(cost_name, total_params)}")
+        _log("Summary:")
+        _log(f"  Total Processed: {self._human_readable(cost_name, total_params)}")
         efficiency = (1.0 - (total_imbalance_params / total_params)) * 100 if total_params > 0 else 100
-        print(f"  Approx. Computational Efficiency: {efficiency:.4f}%")
-        print("=" * 60 + "\n")
+        _log(f"  Approx. Computational Efficiency: {efficiency:.4f}%")
+        _log("=" * 60 + "\n")
 
     def visualize(self, micro_param_groups, title="TP Load Balance Report"):
-        # This part remains the same and is correct.
         self.visualize_cost(micro_param_groups, cost_name="numel", title=f"{title} (Memory View)")
         self.visualize_cost(micro_param_groups, cost_name="flops", title=f"{title} (FLOPs View)")

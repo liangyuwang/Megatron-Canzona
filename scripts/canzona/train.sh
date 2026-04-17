@@ -240,8 +240,7 @@ fi
 DP_BALANCED_OPT_LOG_VISUALIZATION=${DP_BALANCED_OPT_LOG_VISUALIZATION:-0}
 if [ "${DP_BALANCED_OPT_LOG_VISUALIZATION}" -eq 1 ]; then
     GPT_ARGS="${GPT_ARGS} \
-        --dp-balanced-opt-log-visualization \
-        --dp-balanced-opt-log-path ${OUTPUT_CHECKPOINT_PATH}"
+        --dp-balanced-opt-log-visualization"
 fi
 
 # ------------------------------------------------------------
@@ -277,8 +276,7 @@ fi
 TP_BALANCED_OPT_LOG_VISUALIZATION=${TP_BALANCED_OPT_LOG_VISUALIZATION:-0}
 if [ "${TP_BALANCED_OPT_LOG_VISUALIZATION}" -eq 1 ]; then
     GPT_ARGS="${GPT_ARGS} \
-        --tp-balanced-opt-log-visualization \
-        --tp-balanced-opt-log-path ${OUTPUT_CHECKPOINT_PATH}"
+        --tp-balanced-opt-log-visualization"
 fi
 
 # ------------------------------------------------------------

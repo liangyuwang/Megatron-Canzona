@@ -1132,14 +1132,6 @@ def validate_args(args, defaults={}):
             "Canzona optimizer features (async tp opt and load-balanced-opt) only support muon and soap for now"
     if args.use_dp_balanced_opt:
         assert args.use_distributed_optimizer, 'Canzona dp balance requires zero-1'
-    if args.dp_balanced_opt_log_visualization and args.dp_balanced_opt_log_path is None:
-        args.dp_balanced_opt_log_path = os.path.join(os.path.dirname(args.tensorboard_dir),f'canzona-{args.optimizer}-dplb-{args.use_dp_balanced_opt}-tplb-{args.use_tp_balanced_opt}') #save dp balanced opt log to tensorboard_dir by default
-    if args.tp_balanced_opt_log_visualization and args.tp_balanced_opt_log_path is None:
-        args.tp_balanced_opt_log_path = os.path.join(os.path.dirname(args.tensorboard_dir),f'canzona-{args.optimizer}-dplb-{args.use_dp_balanced_opt}-tplb-{args.use_tp_balanced_opt}') #save tp balanced opt log to tensorboard_dir by default
-    if args.tp_balanced_opt_log_visualization and args.rank == 0:
-        os.makedirs(args.tp_balanced_opt_log_path, exist_ok=True)
-    if args.dp_balanced_opt_log_path and args.rank == 0:
-        os.makedirs(args.dp_balanced_opt_log_path, exist_ok=True)
 
     # Print arguments.
     _print_args("arguments", args)
@@ -3150,8 +3142,6 @@ def _add_canzona_args(parser):
                        help='Alpha parameter for DP balanced optimizer. Default is 1.0.')
     group.add_argument('--dp-balanced-opt-log-visualization', action='store_true',
                        help='Enable log visualization for DP balanced optimizer.')
-    group.add_argument('--dp-balanced-opt-log-path', type=str, default=None,
-                       help='Path for DP balanced optimizer log visualization.')
     group.add_argument('--dp-balanced-opt-cost', type=str, default="numel", choices=["numel", "flops"],
                        help='Cost model for DP balanced optimizer. Choices: "numel", "flops". Default is "numel".')
     # TP Async Optimizer
@@ -3166,8 +3156,6 @@ def _add_canzona_args(parser):
                        help='Enable TP balanced optimizer.')
     group.add_argument('--tp-balanced-opt-log-visualization', action='store_true',
                        help='Enable log visualization for TP balanced optimizer.')
-    group.add_argument('--tp-balanced-opt-log-path', type=str, default=None,
-                       help='Path for TP balanced optimizer log visualization.')
     group.add_argument('--tp-balanced-opt-fuse-space', type=int, default=400,
                        help='Fusion space size in MB for TP balanced optimizer. Default is 400.')
     group.add_argument('--tp-balanced-opt-cost', type=str, default="numel", choices=["numel", "flops"],

@@ -97,21 +97,3 @@ def get_optim_flops_from_param(p: torch.Tensor) -> Union[int, float]:
         return estimate_averaged_soap_flops(p.shape, update_freq=args.soap_precondition_frequency, max_precond_dim=args.soap_max_precond_dim)
     else:
         raise ValueError
-
-
-@contextmanager
-def log_to_file(filename: str, enable: bool = False, log_rank: int = 0):
-    enable = (enable and
-        (not torch.distributed.is_initialized() or
-            torch.distributed.get_rank() == log_rank)
-    )
-    if not enable or not filename:
-        yield
-        return
-    original_stdout = sys.stdout
-    try:
-        with open(filename, 'a') as f:
-            sys.stdout = f
-            yield
-    finally:
-        sys.stdout = original_stdout
