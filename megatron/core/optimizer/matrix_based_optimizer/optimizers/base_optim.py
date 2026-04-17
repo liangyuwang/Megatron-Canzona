@@ -2,6 +2,7 @@ import torch
 
 from megatron.core.optimizer.matrix_based_optimizer.load_balanced_tp_executor import AsyncGroupExecutor, SyncGroupExecutor, is_group_tensor_parallel
 from megatron.core.optimizer.matrix_based_optimizer.split_grad_and_state import GradAndStateSplitter
+import gc
 import os
 import copy
 
@@ -28,6 +29,7 @@ class BaseOptim(torch.optim.Optimizer):
             self._cuda_graph_warmup_steps = 3
             self._cuda_graph_current_step = 0
             self._group_meta = copy.deepcopy(defaults)
+            self._mempool = torch.cuda.graph_pool_handle()
     
     def _single_param_update(self, p, u, group):
         dist_optim = 'origin_shape' in group
@@ -101,52 +103,112 @@ class BaseOptim(torch.optim.Optimizer):
         """
         raise NotImplementedError("_inner_single_param_step must be implemented in subclass.")
 
+    def _get_graph_specs(self):
+        """Return the list of (name, kwargs) pairs describing graphs to capture, in order.
+
+        Each entry causes one capture step. During replay, _select_graph_for_replay()
+        picks which graph to use based on the current replay step counter.
+
+        Default: a single graph with no extra kwargs (one-path optimizers like Muon).
+        Override in subclasses for multi-path optimizers (e.g. SOAP uses two graphs).
+        """
+        return [('default', {})]
+
+    def _select_graph_for_replay(self, group, graphs, replay_step):
+        """Return the CUDAGraph to replay for this step.
+
+        graphs: dict[name -> CUDAGraph] built by step_with_cuda_graph during capture.
+        replay_step: 0-based counter that increments once per call after all captures.
+
+        Default: always replay the single 'default' graph.
+        Override in subclasses to implement step-dependent dispatch.
+        """
+        return graphs['default']
+
     def step_with_cuda_graph(self, loss):
+        specs = self._get_graph_specs()          # [(name, kwargs), ...]
+        num_captures = len(specs)
+
         for i, group in enumerate(self.param_groups):
-            group["step"] = group.get("step", 0) + 1
+            # Build shapes_map consistently with step() so subclasses have access to it
             if 'origin_shape' not in group:
+                shapes_map = {p: {'origin_shape': p.shape} for p in group['params']}
                 shapes = [p.shape for p in group['params']]
             else:
+                shapes_map = {p: {'origin_shape': s}
+                              for p, s in zip(group['params'], group["origin_shape"])}
                 shapes = group["origin_shape"]
+            group["shapes_map"] = shapes_map
 
             self._upload_group_meta_to_cuda_graph(group, shapes)
 
             if not is_group_tensor_parallel(group):
-                if self._cuda_graph_current_step < self._cuda_graph_warmup_steps:
-                    self._run_param_updates(group, shapes)
-                elif self._cuda_graph_current_step == self._cuda_graph_warmup_steps:
-                    graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph):
+                current_step = self._cuda_graph_current_step
+
+                if current_step < self._cuda_graph_warmup_steps:
+                    # Run warmup on a dedicated stream so lazy CUDA inits (cuDNN benchmarking,
+                    # memory allocator warm-up) are never recorded into the graph.
+                    if current_step == 0:
+                        torch.cuda.synchronize()  # flush all pending ops before warmup
+                    warmup_stream = torch.cuda.Stream()
+                    with torch.cuda.stream(warmup_stream):
                         self._run_param_updates(group, shapes)
-                    self._cuda_graphs[i] = graph
+                    if current_step == self._cuda_graph_warmup_steps - 1:
+                        torch.cuda.synchronize()  # ensure warmup fully done before capture
+
+                elif current_step < self._cuda_graph_warmup_steps + num_captures:
+                    # Capture phase: one capture step per graph spec, in order.
+                    # Disable GC to avoid PyTorch bug (pytorch/pytorch#161037).
+                    capture_idx = current_step - self._cuda_graph_warmup_steps
+                    name, kwargs = specs[capture_idx]
+                    graph = torch.cuda.CUDAGraph()
+                    gc_enabled = gc.isenabled()
+                    if gc_enabled:
+                        gc.disable()
+                    with torch.cuda.graph(graph, pool=self._mempool):
+                        self._run_param_updates(group, shapes, **kwargs)
+                    if gc_enabled:
+                        gc.enable()
+                    torch.cuda.synchronize()
+                    if i not in self._cuda_graphs:
+                        self._cuda_graphs[i] = {}
+                    self._cuda_graphs[i][name] = graph
+
                 else:
-                    self._cuda_graphs[i].replay()
+                    # Replay: delegate graph selection to the subclass hook.
+                    replay_step = current_step - self._cuda_graph_warmup_steps - num_captures
+                    graph = self._select_graph_for_replay(group, self._cuda_graphs[i], replay_step)
+                    graph.replay()
             else:
                 self.tp_param_group_executor.execute(
                     group, shapes,
                     self._single_param_step,
                     self._single_param_update
                 )
-            
+
             self._offload_group_meta_from_cuda_graph(group, shapes)
 
         self._cuda_graph_current_step += 1
         return loss
 
-    def _run_param_updates(self, group, shapes):
+    def _run_param_updates(self, group, shapes, **kwargs):
         if not is_group_tensor_parallel(group):
             for p, s in zip(group["params"], shapes):
                 if p.grad is None:
                     continue
-                tensor_to_update_p = self._single_param_step(p, s, group)
+                tensor_to_update_p = self._single_param_step(p, s, group, **kwargs)
                 self._single_param_update(p, tensor_to_update_p, group)
-    
+
     def _upload_group_meta_to_cuda_graph(self, group, shapes):  # adjust _group_meta if more meta info changes
         if "lr_tensor" not in self._group_meta:
-            self._group_meta["lr_tensor"] = torch.tensor(group["lr"], device=torch.cuda.current_device())
+            self._group_meta["lr_tensor"] = torch.tensor(
+                group["lr"],
+                dtype=torch.float32,
+                device=torch.cuda.current_device()
+            )
         else:
             self._group_meta["lr_tensor"].fill_(group["lr"])
         group["lr"] = self._group_meta["lr_tensor"]
-    
+
     def _offload_group_meta_from_cuda_graph(self, group, shapes):
         group["lr"] = self._group_meta["lr_tensor"].item()

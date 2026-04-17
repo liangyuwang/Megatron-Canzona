@@ -79,8 +79,6 @@ class SOAP(BaseOptim):
         self._data_format = data_format
         assert precondition_1d is False, 'only support dim=2 for now.'
         assert merge_dims is False, 'only support merge_dims=False for now.'
-        if self.use_cuda_graph:
-            raise NotImplementedError
 
     def _single_param_update(self, p, u, group, shapes_map=None):
         weight_decay = group["weight_decay"]
@@ -91,7 +89,9 @@ class SOAP(BaseOptim):
         # Use the step_size computed in _single_param_step and stored in group
         if group.get('updated', False):
             # skip whole update when not step soap
-            p.add_(u, alpha=-lr)
+            # Multiply lr into u rather than using alpha= so tensor lr (from CUDA graph path)
+            # is handled correctly — add_'s alpha parameter requires a Python scalar.
+            p.add_(u * (-lr))
 
             # From AdamW code: Just adding the square of the weights to the loss function is *not*
             # the correct way of using L2 regularization/weight decay with Adam,
@@ -102,10 +102,10 @@ class SOAP(BaseOptim):
             # of the weights to the loss with plain (non-momentum) SGD.
             # Add weight decay at the end (fixed version)
             if weight_decay > 0.0:
-                p.add_(p, alpha=(-lr * weight_decay))
+                p.add_(p * ((-lr) * weight_decay))
             u = None
 
-    def _inner_single_param_step(self, name, p, grad, group):
+    def _inner_single_param_step(self, name, p, grad, group, update_q: bool = False):
         shape_map = group["shapes_map"][p]
         # assert len(grad.shape) == 2, 'More scenarios need to be supported.'
         shape_map[f"{name}exp_avg"] = grad.shape
@@ -139,7 +139,6 @@ class SOAP(BaseOptim):
 
         if f"{name}step" not in state:
             state[f"{name}step"] = torch.tensor([0], device=grad.device)
-        step = state[f"{name}step"].item()
 
         # State initialization
         if f"{name}exp_avg" not in state:
@@ -154,30 +153,31 @@ class SOAP(BaseOptim):
                 # Exponential moving average of squared gradient values
                 state[f"{name}exp_avg_sq"] = torch.zeros_like(grad)
 
+        # Path 1: first step only — initialize preconditioner but skip param update.
+        # This branch uses Python dict iteration and is never reached during CUDA graph capture
+        # because all state is fully initialized during the warmup phase.
         if not any(key.startswith(f"{name}Q_") for key in state):
             state = self.init_preconditioner(
-                grad,
-                state,
-                dist_optim,
-                max_precond_dim=max_precond_dim,
-                name=name,
+                grad, state, dist_optim, max_precond_dim=max_precond_dim, name=name,
             )
-            state = self.update_preconditioner(grad,
-                                                state,
-                                                shape_map,
-                                                dist_optim,
-                                                step,
-                                                precondition_frequency=precondition_frequency,
-                                                max_precond_dim=max_precond_dim,
-                                                shampoo_beta=shampoo_beta,
-                                                name=name)
-            return # first step is skipped so that we never use the current gradients in the projection.
+            state = self.update_preconditioner(
+                grad, state, shape_map, dist_optim,
+                precondition_frequency=precondition_frequency,
+                max_precond_dim=max_precond_dim, shampoo_beta=shampoo_beta,
+                name=name, update_q=False,
+            )
+            return  # first step is skipped so that we never use the current gradients in the projection.
+
+        # Path 2 / Path 3: real update (may run inside a CUDA graph).
+        # Increment step in-place to avoid .item() which is forbidden during graph capture.
+        state[f"{name}step"].add_(1)
+        step = state[f"{name}step"]  # keep as tensor; used for bias correction below
 
         # Projecting gradients to the eigenbases of Shampoo's preconditioner
         # i.e. projecting to the eigenbases of matrices in state['GG']
         grad_projected = self.project(grad, state, shape_map, name)
-        exp_avg, exp_avg_sq = state[f"{name}exp_avg"].view(shape_map[f"{name}exp_avg"]), state[f"{name}exp_avg_sq"].view(shape_map[f"{name}exp_avg_sq"])
-        step += 1
+        exp_avg = state[f"{name}exp_avg"].view(shape_map[f"{name}exp_avg"])
+        exp_avg_sq = state[f"{name}exp_avg_sq"].view(shape_map[f"{name}exp_avg_sq"])
         # Decay the first and second moment running average coefficient
         # In-place operations to update the averages at the same time
         exp_avg.lerp_(grad, weight=1.0 - beta1)
@@ -190,6 +190,7 @@ class SOAP(BaseOptim):
 
         scale = 1
         if correct_bias:
+            # step is an int32 tensor; float ** int_tensor is promoted to a float tensor by PyTorch.
             bias_correction1 = 1.0 - beta1 ** step
             bias_correction2 = 1.0 - beta2 ** step
             scale = (bias_correction2 ** .5) / bias_correction1
@@ -200,18 +201,22 @@ class SOAP(BaseOptim):
             norm_grad = norm_grad / (1e-30+torch.mean(norm_grad**2)**0.5)
         norm_grad = norm_grad * scale
 
-        # Update is done after the gradient step to avoid using current gradients in the projection.
-        state = self.update_preconditioner(grad, state, shape_map, dist_optim, step,
-                                    precondition_frequency=precondition_frequency,
-                                    max_precond_dim=max_precond_dim,
-                                    shampoo_beta=shampoo_beta,
-                                    name=name)
+        # Update preconditioner: update_q controls whether GG and Q are refreshed this step.
+        # In the normal (non-graph) path update_q is always False (step % freq is checked inside).
+        # In the CUDA graph path, update_q is set externally by step_with_cuda_graph so the
+        # Python-level conditional never executes inside the captured graph.
+        state = self.update_preconditioner(
+            grad, state, shape_map, dist_optim,
+            precondition_frequency=precondition_frequency,
+            max_precond_dim=max_precond_dim, shampoo_beta=shampoo_beta,
+            name=name, update_q=update_q,
+        )
 
-        # flatten state
-        for key in list(state.keys()):
-            state[f"{name}step"] = torch.tensor([step], device=grad.device)
-            if dist_optim:
-                state[key] = state[key].reshape(-1)
+        # The flatten-state loop (state[key].reshape(-1)) has been removed:
+        # - All moment tensors are updated via in-place lerp_() so their underlying
+        #   1-D storage is already correct for the next dist_optim view.
+        # - get_orthogonal_matrix_QR writes Q and exp_avg_sq back to state internally.
+        # - step is updated in-place via add_(1) above; no new tensor is needed.
         group["updated"] = True
 
         return norm_grad
@@ -251,13 +256,18 @@ class SOAP(BaseOptim):
                               state,
                               param_to_os_shape,
                               dist_optim,
-                              step,
                               precondition_frequency=10,
                               max_precond_dim=10000,
                               shampoo_beta=-1,
-                              name=""):
+                              name="",
+                              update_q: bool = False):
         """
         Updates the preconditioner matrices and the eigenbases (L, R, Q_L, Q_R in the paper).
+
+        update_q: when True, refreshes GG and Q via get_orthogonal_matrix_QR.
+                  In the non-CUDA-graph path this is controlled by precondition_frequency
+                  at the call site; in the CUDA graph path it is decided by step_with_cuda_graph
+                  so that the branch never executes inside a captured graph.
         """
 
         for idx, sh in enumerate(grad.shape):
@@ -279,7 +289,7 @@ class SOAP(BaseOptim):
                     else:
                         state[f"{name}Q_{idx}"] = q
 
-        if step > 0 and step % precondition_frequency == 0:
+        if update_q:
             state = self.get_orthogonal_matrix_QR(state, param_to_os_shape, dist_optim, max_precond_dim, name=name)
 
         return state
@@ -377,14 +387,62 @@ class SOAP(BaseOptim):
             final.append(Q)
 
 
-        state[f"{name}exp_avg_sq"] = exp_avg_sq
-        for idx,q in enumerate(final):
+        # Write back results using .copy_() when the key already exists so that the
+        # same Python tensor object (and its CUDA memory address) is reused.
+        # Dict reassignment would create a new tensor object; the old one could be
+        # freed by Python GC while a sibling CUDA graph still holds its address,
+        # causing cudaErrorIllegalAddress on replay.
+        key_sq = f"{name}exp_avg_sq"
+        if key_sq in state:
+            state[key_sq].view(param_to_os_shape[key_sq]).copy_(exp_avg_sq)
+        else:
+            state[key_sq] = exp_avg_sq
+        for idx, q in enumerate(final):
             if len(q) > 0:
-                if dist_optim:
-                    state[f"{name}Q_{idx}"] = q.reshape(-1)
+                key = f"{name}Q_{idx}"
+                q_val = q.reshape(-1) if dist_optim else q
+                if key in state:
+                    state[key].copy_(q_val)
                 else:
-                    state[f"{name}Q_{idx}"] = q
+                    state[key] = q_val
         return state
+
+    def _single_param_step(self, p, s, group, g=None, update_q: bool = False):
+        """Override base _single_param_step to forward update_q to _inner_single_param_step."""
+        if is_group_tensor_parallel(group) and g is None:
+            raise RuntimeError("'g' must be provided when using TP.")
+        g = p.grad.view(s) if g is None else g
+        true_attrs = self.grad_and_state_splitter.get_split_param_methods(p)
+        if true_attrs:
+            assert len(true_attrs) == 1, (
+                f"Only one of {self.grad_and_state_splitter.get_attrs()} can be set "
+                f"for a param, got {true_attrs}"
+            )
+            split_method = true_attrs[0]
+            grads = self.grad_and_state_splitter.split(g, split_method, g.shape)
+            grads = [
+                self._inner_single_param_step(
+                    f"{split_method}.{idx}.", p, gg, group, update_q=update_q
+                )
+                for idx, gg in enumerate(grads)
+            ]
+            if None in grads:
+                return torch.zeros_like(g)
+            u = self.grad_and_state_splitter.gather(grads, split_method, g.shape)
+        else:
+            u = self._inner_single_param_step("", p, g, group, update_q=update_q)
+            if u is None:
+                return torch.zeros_like(g)
+        return u.to(g.dtype)
+
+    def _get_graph_specs(self):
+        """SOAP captures two graphs: path2 (no Q update) and path3 (with Q update)."""
+        return [('path2', {'update_q': False}), ('path3', {'update_q': True})]
+
+    def _select_graph_for_replay(self, group, graphs, replay_step):
+        """Dispatch to path3 every precondition_frequency steps, otherwise path2."""
+        use_path3 = replay_step > 0 and replay_step % group['precondition_frequency'] == 0
+        return graphs['path3'] if use_path3 else graphs['path2']
 
 def get_mat_list(state, shape_map, key, name=""):
     if name == "":
