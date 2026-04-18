@@ -130,6 +130,7 @@ class BaseOptim(torch.optim.Optimizer):
         num_captures = len(specs)
 
         for i, group in enumerate(self.param_groups):
+            group["step"] = group.get("step", 0) + 1
             # Build shapes_map consistently with step() so subclasses have access to it
             if 'origin_shape' not in group:
                 shapes_map = {p: {'origin_shape': p.shape} for p in group['params']}
