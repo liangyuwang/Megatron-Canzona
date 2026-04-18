@@ -26,6 +26,7 @@ SEQ_LEN=2048
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-128}
 BATCH_SIZE=${BATCH_SIZE:-8}
 MP_SIZE=${MP_SIZE:-1}
+EP_SIZE=${EP_SIZE:-1}
 PP_SIZE=${PP_SIZE:-1}
 GPUS_PER_NODE=8
 
@@ -72,6 +73,39 @@ case "$MODEL_SIZE" in
         NUM_ATTN_HEADS=64
         NUM_QUERY_GROUPS=8
         KV_CHANNELS=128
+        ;;
+    7B-A1B)
+        NUM_LAYERS=28
+        HIDDEN_SIZE=2048
+        FFN_HIDDEN_SIZE=6144
+        NUM_ATTN_HEADS=16
+        NUM_QUERY_GROUPS=8
+        KV_CHANNELS=128
+        MOE_FFN_HIDDEN_SIZE=768
+        MOE_TOPK=4
+        NUM_EXPERTS=64
+        ;;
+    30B-A3B)
+        NUM_LAYERS=48
+        HIDDEN_SIZE=2048
+        FFN_HIDDEN_SIZE=6144
+        NUM_ATTN_HEADS=32
+        NUM_QUERY_GROUPS=4
+        KV_CHANNELS=128
+        MOE_FFN_HIDDEN_SIZE=768
+        MOE_TOPK=8
+        NUM_EXPERTS=128
+        ;;
+    235B-A22B)
+        NUM_LAYERS=94
+        HIDDEN_SIZE=4096
+        FFN_HIDDEN_SIZE=12288
+        NUM_ATTN_HEADS=64
+        NUM_QUERY_GROUPS=4
+        KV_CHANNELS=128
+        MOE_FFN_HIDDEN_SIZE=1536
+        MOE_TOPK=8
+        NUM_EXPERTS=128
         ;;
     *)
         echo "Unsupported model size: ${MODEL_SIZE}"
@@ -174,7 +208,17 @@ GPT_ARGS="
         --tensorboard-dir ${TENSORBOARD_DIR} \
         --eval-interval 1000 \
         --eval-iters 10 \
+        --ddp-bucket-size 400000000 \
 "
+
+if [ -n "${NUM_EXPERTS}" ] && [ -n "${MOE_TOPK}" ] && [ -n "${MOE_FFN_HIDDEN_SIZE}" ]; then
+    GPT_ARGS="${GPT_ARGS} \
+        --expert-model-parallel-size ${EP_SIZE} \
+        --moe-ffn-hidden-size ${MOE_FFN_HIDDEN_SIZE} \
+        --moe-router-topk ${MOE_TOPK} \
+        --num-experts ${NUM_EXPERTS}"
+    echo "MoE enabled: experts=${NUM_EXPERTS}, topk=${MOE_TOPK}, ffn=${MOE_FFN_HIDDEN_SIZE}"
+fi
 
 if [ "${ACTIVATION_CHECKPOINT}" = "true" ]; then
     GPT_ARGS="${GPT_ARGS} --recompute-granularity selective"
@@ -193,6 +237,7 @@ DATA_ARGS="
         --vocab-file ${VOCAB_FILE} \
         --merge-file ${MERGE_FILE} \
 "
+
 
 # ============================================================
 # Canzona arguments
@@ -290,18 +335,17 @@ if [ "${USE_MATRIX_BASED_OPTIM_SPLIT}" -eq 1 ]; then
         --matrix-based-optimizer-split-qkv-per-head"
 fi
 
-# ============================================================
-# Layerwise-Muon arguments
-# ============================================================
+# ------------------------------------------------------------
+# Matrix-based optimizer CUDA Graph
+# ------------------------------------------------------------
+export USE_CUDA_GRAPH_OPTIM=${USE_CUDA_GRAPH_OPTIM:-1}
 
-# https://github.com/NVIDIA/Megatron-LM/pull/2241
+# ------------------------------------------------------------
+# Matrix-based DDP Buffer Bucket Size
+# ------------------------------------------------------------
+export MATRIX_BASED_OPTIM_DENSE_BUCKET_SIZE=${MATRIX_BASED_OPTIM_DENSE_BUCKET_SIZE:-400000000}
+export MATRIX_BASED_OPTIM_EXPERT_BUCKET_SIZE=${MATRIX_BASED_OPTIM_EXPERT_BUCKET_SIZE:-400000000}
 
-LAYERWISE_MUON=${LAYERWISE_MUON:-0}
-if [ "${LAYERWISE_MUON}" -eq 1 ]; then
-    GPT_ARGS="${GPT_ARGS} \
-        --optimizer layerwise-muon \
-        "
-fi
 
 # ============================================================
 # Launch training
