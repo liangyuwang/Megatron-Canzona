@@ -214,6 +214,7 @@ GPT_ARGS="
 if [ -n "${NUM_EXPERTS}" ] && [ -n "${MOE_TOPK}" ] && [ -n "${MOE_FFN_HIDDEN_SIZE}" ]; then
     GPT_ARGS="${GPT_ARGS} \
         --expert-model-parallel-size ${EP_SIZE} \
+        --expert-tensor-parallel-size 1 \
         --moe-ffn-hidden-size ${MOE_FFN_HIDDEN_SIZE} \
         --moe-router-topk ${MOE_TOPK} \
         --num-experts ${NUM_EXPERTS}"
