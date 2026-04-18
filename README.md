@@ -14,6 +14,80 @@ Megatron-Canzona
 
 ![Canzona Overview](images/canzona-overview.png)
 
+<div align="left">
+
+Canzona enables matrix-based optimizers such as **Muon** and **SOAP** to run efficiently within Megatron's multi-dimensional parallelism (DP, TP, PP, EP). These optimizers require complete (non-sharded) weight matrices to compute preconditioners or orthogonalization, but Megatron's Tensor Parallelism and Distributed Optimizer fragment parameters across GPUs. Canzona resolves this by decoupling logical optimizer assignment from physical parameter distribution — introducing load-balanced DP partitioning, async TP micro-group scheduling, parameter splitting, and bucket regrouping so that matrix-based optimization scales to hundreds of GPUs without stragglers.
+
+### Features
+
+- **Mixed Optimizer Strategy** — assigns Muon/SOAP to 2D weight matrices and Adam to embeddings, biases, and routing weights, all within a single training run.
+- **Adaptive DP Bucket Sizing** — adjusts bucket boundaries so each DP rank receives an equal share, maximizing *even* (uniform) buckets that use fast native collectives; remaining *uneven* buckets fall back to coalesced custom reduce-scatter/all-gather.
+- **DP Load-Balanced Partitioning** — alpha-balanced greedy LPT algorithm distributes optimization cost evenly across DP ranks, eliminating reduce-scatter stragglers.
+- **TP Async Compute Pipeline** — overlapped Gather → Compute → Scatter → Update pipeline with configurable micro-group scheduling modes (`no`, `single`, `slot`, `global`).
+- **Parameter Splitting** — large weight matrices (QKV, FC1, linear-attn) are further split into sub-fragments for finer-grained optimization with automatic gradient reassembly.
+- **Extensible Optimizer Plugin API** — add new matrix-based optimizers by implementing a few abstract methods; see [Adding a New Optimizer](megatron/core/optimizer/matrix_based_optimizer/optimizers/README.md).
+- **CUDA Graph Support** — optional CUDA graph capture for Muon and SOAP compute kernels to reduce kernel launch overhead.
+
+### Usage
+
+Enable Canzona features via command-line flags (see [`megatron/training/arguments.py`](megatron/training/arguments.py)):
+
+```bash
+# Select a matrix-based optimizer
+--optimizer muon          # or --optimizer soap
+
+# Enable distributed optimizer (required for DP/TP load balancing)
+--use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather
+
+# DP load-balanced partitioning
+--use-dp-balanced-opt --dp-balanced-opt-alpha 1.0 --dp-balanced-opt-cost numel
+
+# TP async optimization (enabled by default when using Muon/SOAP)
+--use-tp-sync-opt
+
+# TP load-balanced micro-group scheduling
+--use-tp-balanced-opt --tp-balanced-opt-cost flops
+
+# Parameter splitting for QKV and FC1
+--matrix-based-optimizer-split-qkv --matrix-based-optimizer-split-fc1
+
+# Adjust dense/expert buffer bucket size
+MATRIX_BASED_OPTIM_DENSE_BUCKET_SIZE=400000000
+MATRIX_BASED_OPTIM_EXPERT_BUCKET_SIZE=400000000
+
+# Enable CUDA graph for optimizer compute
+export USE_CUDA_GRAPH_OPTIM=1
+```
+
+The following examples are based on [`scripts/canzona/train.sh`](scripts/canzona/train.sh)
+```bash
+cd scripts/canzona/
+bash prepare.sh # to prepare example dataset
+
+# Train GPT model with Canzona
+export USE_MUON=1 # or USE_SOAP=1
+export USE_DP_ASYNC_OPT=1 # enable distributed optimizer with overlap
+export USE_DP_BALANCED_OPT=1 # DP load-balanced partitioning
+export DP_BALANCED_OPT_LOG_VISUALIZATION=1 # log DP bucket balance visualization
+export USE_TP_ASYNC_OPT=1 # TP async optimizer (enabled by default with Muon/SOAP)
+export USE_TP_BALANCED_OPT=1 # TP load-balanced micro-group scheduling
+export TP_BALANCED_OPT_LOG_VISUALIZATION=1 # log TP micro-group balance visualization
+export USE_MATRIX_BASED_OPTIM_SPLIT=1 # split QKV/FC1 weights for finer-grained optimization
+export USE_CUDA_GRAPH_OPTIM=1 # enable CUDA graph for optimizer compute
+export MATRIX_BASED_OPTIM_DENSE_BUCKET_SIZE=400000000 # dense buffer bucket size
+export MATRIX_BASED_OPTIM_EXPERT_BUCKET_SIZE=400000000 # expert buffer bucket size
+BATCH_SIZE=4 MP_SIZE=4 TRAIN_STEPS=100000 GLOBAL_BATCH_SIZE=128 SAVE_INTERVAL=100000 MODEL_SIZE=1B bash train.sh
+```
+
+### Roadmap
+
+- **HSDP (Hybrid Sharded Data Parallel)** — extend DP load-balancing to hybrid sharding topologies (DP × FSDP).
+- **FSDP Compatibility** — support matrix-based optimizers under `--use-megatron-fsdp` and `--use-torch-fsdp2`.
+- **More Optimizers** — additional matrix-based optimizers via the plugin API.
+- **Higher-Performance Communication Primitives** — custom fused all-gather-v / reduce-scatter-v kernels to replace generic PyTorch collectives for uneven bucket communication.
+
+<div align="center">
+
 ---
 
 Megatron-LM & Megatron Core
