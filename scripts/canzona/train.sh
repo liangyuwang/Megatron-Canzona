@@ -338,7 +338,7 @@ fi
 # ------------------------------------------------------------
 # Matrix-based optimizer CUDA Graph
 # ------------------------------------------------------------
-export USE_CUDA_GRAPH_OPTIM=${USE_CUDA_GRAPH_OPTIM:-1}
+export USE_CUDA_GRAPH_OPTIM=${USE_CUDA_GRAPH_OPTIM:-0}
 
 # ------------------------------------------------------------
 # Matrix-based DDP Buffer Bucket Size
