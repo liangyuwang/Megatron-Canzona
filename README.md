@@ -21,12 +21,12 @@ Canzona enables matrix-based optimizers such as **Muon** and **SOAP** to run eff
 ### Features
 
 - **Mixed Optimizer Strategy** — assigns Muon/SOAP to 2D weight matrices and Adam to embeddings, biases, and routing weights, all within a single training run.
-- **Adaptive DP Bucket Sizing** — adjusts bucket boundaries so each DP rank receives an equal share, maximizing *even* (uniform) buckets that use fast native collectives; remaining *uneven* buckets fall back to coalesced custom reduce-scatter/all-gather.
 - **DP Load-Balanced Partitioning** — alpha-balanced greedy LPT algorithm distributes optimization cost evenly across DP ranks, eliminating reduce-scatter stragglers.
 - **TP Async Compute Pipeline** — overlapped Gather → Compute → Scatter → Update pipeline with configurable micro-group scheduling modes (`no`, `single`, `slot`, `global`).
 - **Parameter Splitting** — large weight matrices (QKV, FC1, linear-attn) are further split into sub-fragments for finer-grained optimization with automatic gradient reassembly.
 - **Extensible Optimizer Plugin API** — add new matrix-based optimizers by implementing a few abstract methods; see [Adding a New Optimizer](megatron/core/optimizer/matrix_based_optimizer/optimizers/README.md).
 - **CUDA Graph Support** — optional CUDA graph capture for Muon and SOAP compute kernels to reduce kernel launch overhead.
+- **Adaptive DP Bucket Sizing** — adjusts bucket boundaries so each DP rank receives an equal share, maximizing *even* (uniform) buckets that use fast native collectives; remaining *uneven* buckets fall back to coalesced custom reduce-scatter/all-gather.
 
 ### Quick Start
 
