@@ -109,6 +109,8 @@ class MyOptim(BaseOptim):
 - If your optimizer needs per-head or per-branch splitting (like Muon/SOAP for QKV weights), pass `split_my_optim_params=True` and `split_my_optim_shape_map=...` to the parent constructor. The `GradAndStateSplitter` will automatically split gradients before `_inner_single_param_step` and reassemble updates afterward.
 - For TP-sharded params, the `AsyncGroupExecutor` gathers full gradients, calls `_single_param_step`, scatters updates back, and applies them via `_single_param_update`. No extra TP handling is needed in your optimizer class.
 
+> **CUDA Graph note:** Enabling CUDA graph for a new optimizer (`USE_CUDA_GRAPH_OPTIM=1`) requires writing a dedicated graph-capture function for your optimizer's compute kernel (see `optimizers/muon.py` and `optimizers/soap.py` for reference). This involves non-trivial engineering effort to ensure correct state management, split-parameter handling, and TP synchronization within the captured graph.
+
 ---
 
 ## Step 2: Register Tagging Predicates
@@ -188,7 +190,7 @@ elif isinstance(optimizer, SOAP):
 elif isinstance(optimizer, MyOptim):     # <-- Add
     self.use_optimizer = 'my_optim'      # <-- Add
 else:
-    warnings.warn("Only Adam currently supported, due to checkpointing requirements.")
+    raise NotImplementedError(f"Unsupported optimizer: {type(optimizer)}")
 ```
 
 Also add the import at the top of the file:
@@ -394,3 +396,4 @@ If your optimizer needs custom parameter splitting (like QKV/FC1 splitting), add
 - [ ] Config fields in `megatron/core/optimizer/optimizer_config.py`
 - [ ] CLI arguments in `megatron/training/arguments.py`
 - [ ] Validation rules in `validate_args()` in `megatron/training/arguments.py`
+- [ ] Import in `megatron/core/optimizer/matrix_based_optimizer/__init__.py`

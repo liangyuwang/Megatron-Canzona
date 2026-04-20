@@ -56,18 +56,19 @@ Evaluated on Qwen3 models (up to 32B parameters) on 256 GPUs:
 
 ```
 megatron/core/optimizer/matrix_based_optimizer/
-├── __init__.py                              # Public exports
+├── __init__.py                              # Public exports, param group wiring
 ├── distrib_optimizer.py                     # DistMatrixBasedOptimizer: core distributed optimizer
 ├── param_and_grad_buffer.py                 # _MatrixBasedParamAndGradBucketGroup: bucket management
-├── load_balanced_dp_buffer.py               # DP load-balancing (greedy LPT algorithm)
+├── load_balanced_dp_buffer.py               # DP load-balancing (greedy LPT + alpha)
 ├── load_balanced_tp_executor.py             # TP async execution (AsyncGroupExecutor)
-├── split_grad_and_state.py                  # GradAndStateSplitter: parameter splitting logic
-├── utils.py                                 # Utilities: FLOPs estimation, helpers
+├── split_grad_and_state.py                  # GradAndStateSplitter: parameter splitting
+├── comm_extension/                          # Coalesced all-gather-v / reduce-scatter-v primitives
+├── utils.py                                 # FLOPs estimation, tagging predicates
 ├── optimizers/
 │   ├── README.md                            # Adding a new matrix-based optimizer
-│   ├── base_optim.py                        # BaseOptim: common optimizer base class
-│   ├── muon.py                              # Muon optimizer (Newton-Schulz orthogonalization)
-│   └── soap.py                              # SOAP optimizer (Shampoo + Adam)
+│   ├── base_optim.py                        # BaseOptim: abstract base class
+│   ├── muon.py                              # Muon (Newton-Schulz orthogonalization)
+│   └── soap.py                              # SOAP (Shampoo + Adam)
 └── README.md                                # This file
 ```
 
@@ -143,9 +144,21 @@ Certain large weight matrices can be further split into sub-matrices for finer-g
 
 The `GradAndStateSplitter` handles splitting gradients into 2D sub-fragments before the optimizer step and reassembling them afterward, maintaining separate optimizer state for each fragment.
 
-### 5. Bucket Regrouping (`param_and_grad_buffer.py`)
+### 5. Adaptive Bucket Sizing (`param_and_grad_buffer.py`, `comm_extension/`)
 
-The `_MatrixBasedParamAndGradBucketGroup` extends Megatron's bucket group to support non-uniform reduce-scatter and all-gather operations needed for load-balanced DP partitioning. The `partition_matrix_based_buckets()` function handles the special case of merging FP8 and non-FP8 buckets for efficient communication aggregation.
+Canzona adjusts bucket boundaries so each DP rank receives an equal share of parameters, maximizing **even buckets** — where every DP rank gets an identical shard size. Even buckets use fast native PyTorch collectives (`all_gather_into_tensor`, `reduce_scatter_tensor`), while remaining **uneven buckets** fall back to coalesced custom `all-gather-v` / `reduce-scatter-v` primitives from [`comm_extension/`](./comm_extension/).
+
+The `_MatrixBasedParamAndGradBucketGroup._classify_buckets()` method checks whether all shards within a bucket have equal size:
+```python
+even_shard = len(set([r.end - r.start for r in bucket.real_gbuf_world_ranges])) == 1
+```
+
+Buckets are classified into `even_buckets` and `uneven_buckets`, allowing different communication paths to run in parallel via `torch.distributed._coalescing_manager`. Bucket size is controlled via environment variables `MATRIX_BASED_OPTIM_DENSE_BUCKET_SIZE` and `MATRIX_BASED_OPTIM_EXPERT_BUCKET_SIZE`.
+
+### 6. Distributed Checkpointing
+
+`DistMatrixBasedOptimizer` implements `sharded_state_dict()` with `fully_sharded_model_space` sharding. Optimizer states (momentum buffers, preconditioner matrices, etc.) are saved per-param-shard and can be reloaded at different DP/TP configurations. The `sharded_param_state_fs_model_space()` method handles the mapping between model param shards and their optimizer states, including special handling for TP-sharded parameters.
+
 
 ## Supported Optimizers
 
@@ -183,10 +196,10 @@ Combines Adam with Shampoo-style preconditioning via eigenvalue decomposition of
 --optimizer soap
 ```
 
-### Canzona Features
+### DP & TP Adaptation
 
 ```bash
-# DP load balancing (requires --use-distributed-optimizer)
+# DP load balancing (requires --use-distributed-optimizer, --overlap-grad-reduce, --overlap-param-gather)
 --use-dp-balanced-opt
 --dp-balanced-opt-alpha 1.0          # 1.0 = pure DP balance, 0.0 = pure comm balance
 --dp-balanced-opt-cost flops         # "numel" or "flops"
@@ -196,11 +209,25 @@ Combines Adam with Shampoo-style preconditioning via eigenvalue decomposition of
 # --use-tp-sync-opt                  # Use this flag to DISABLE async TP
 --no-async-tp-fuse-comm             # Disable fused all-to-all communication
 
-# TP load balancing
+# TP load-balanced micro-group scheduling
 --use-tp-balanced-opt               # Enable TP load-balanced scheduling
 --tp-balanced-opt-cost flops        # "numel" or "flops"
 --tp-balanced-opt-fuse-space 400    # Max slot size in MB
 --tp-balanced-opt-log-visualization
+```
+
+### CUDA Graph
+
+```bash
+export USE_CUDA_GRAPH_OPTIM=1         # Enable CUDA graph for optimizer compute
+```
+
+### Adaptive DP bucket sizing
+See [bucket_size_calculator.py](../../../../scripts/canzona/bucket_size_calculator.py)
+```bash
+# Enable higher performance communication operators
+export MATRIX_BASED_OPTIM_DENSE_BUCKET_SIZE=400000000
+export MATRIX_BASED_OPTIM_EXPERT_BUCKET_SIZE=400000000
 ```
 
 ### Parameter Splitting
@@ -242,14 +269,10 @@ See `scripts/canzona/` for reference training scripts:
 - `scripts/canzona/prepare.sh` — Environment preparation
 - `scripts/canzona/train.sh` — Training launch script
 
-## Constraints and Limitations
+## Roadmap
 
-- **FSDP not supported:** `--use-megatron-fsdp` and `--use-torch-fsdp2` are incompatible with matrix-based optimizers.
-- **CPU offload not supported:** `--optimizer-cpu-offload` is incompatible.
-- **Expert TP not supported:** `--expert-tensor-parallel-size > 1` is not supported when using matrix-based optimizers with MoE.
-- **Checkpointing:** Only `fully_sharded_model_space` sharding type is supported for distributed checkpointing with matrix-based optimizers.
-- **Split + Async TP:** `split_matrix_based_optimizer_params` with `use_tp_async_opt` does not have `init_state_fn` implemented yet.
-
-## Distributed Checkpointing
-
-`DistMatrixBasedOptimizer` implements `sharded_state_dict()` with `fully_sharded_model_space` sharding. Optimizer states (momentum buffers, preconditioner matrices, etc.) are saved per-param-shard and can be reloaded at different DP/TP configurations. The `sharded_param_state_fs_model_space()` method handles the mapping between model param shards and their optimizer states, including special handling for TP-sharded parameters.
+- **HSDP (Hybrid Sharded Data Parallel)** — extend DP load-balancing to hybrid sharding topologies (DP × FSDP).
+- **More Optimizers** — additional matrix-based optimizers via the plugin API.
+- **Higher-Performance Communication Primitives** — custom fused all-gather-v / reduce-scatter-v kernels to replace generic PyTorch collectives for uneven bucket communication.
+- **FSDP Compatibility** — support matrix-based optimizers under `--use-megatron-fsdp` and `--use-torch-fsdp2`.
+- **Checkpointing:** Support more sharding types, not only `fully_sharded_model_space`.

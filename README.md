@@ -28,7 +28,7 @@ Canzona enables matrix-based optimizers such as **Muon** and **SOAP** to run eff
 - **Extensible Optimizer Plugin API** — add new matrix-based optimizers by implementing a few abstract methods; see [Adding a New Optimizer](megatron/core/optimizer/matrix_based_optimizer/optimizers/README.md).
 - **CUDA Graph Support** — optional CUDA graph capture for Muon and SOAP compute kernels to reduce kernel launch overhead.
 
-### Usage
+### Quick Start
 
 Enable Canzona features via command-line flags (see [`megatron/training/arguments.py`](megatron/training/arguments.py)):
 
@@ -79,13 +79,6 @@ export MATRIX_BASED_OPTIM_EXPERT_BUCKET_SIZE=400000000 # expert buffer bucket si
 export MODEL_SIZE=1B # Dense 1B to 32B, MoE 7B-A1B to 235B-A22B
 BATCH_SIZE=4 MP_SIZE=4 TRAIN_STEPS=100000 GLOBAL_BATCH_SIZE=128 SAVE_INTERVAL=100000 bash train.sh
 ```
-
-### Roadmap
-
-- **HSDP (Hybrid Sharded Data Parallel)** — extend DP load-balancing to hybrid sharding topologies (DP × FSDP).
-- **FSDP Compatibility** — support matrix-based optimizers under `--use-megatron-fsdp` and `--use-torch-fsdp2`.
-- **More Optimizers** — additional matrix-based optimizers via the plugin API.
-- **Higher-Performance Communication Primitives** — custom fused all-gather-v / reduce-scatter-v kernels to replace generic PyTorch collectives for uneven bucket communication.
 
 <div align="center">
 
