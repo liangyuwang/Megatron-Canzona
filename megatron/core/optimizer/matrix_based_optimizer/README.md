@@ -119,10 +119,20 @@ The `greedy_lpt_with_ranges()` algorithm:
 For TP-sharded parameters, the optimizer must gather full gradients before computing the update. Canzona's `AsyncGroupExecutor` implements a Gather → Compute → Scatter → Update pipeline:
 
 ```
-Rank 0:  [Gather grads] → [Compute update] → [Scatter updates] → [Apply update]
-Rank 1:  [Send grads]   →    (idle)        → [Receive updates] → [Apply update]
-Rank 2:  [Send grads]   →    (idle)        → [Receive updates] → [Apply update]
+Micro-group with params {P1, P2, P3}: Assign {P1, P3} to Rank 0, Assign {P2} to Rank 1
+
+Rank 0:  [Gather full grads for P1 & P3, send shards of P2 to Rank 1]
+         → [Compute update for P1 & P3]
+         → [Scatter updates for P1 & P3, receive update shard of P2]
+         → [Apply update]
+
+Rank 1:  [Send shards of P1 & P3 to Rank 0, gather full grads for P2]
+         → [Compute update for P2]
+         → [Receive update shards of P1 & P3, scatter update for P2]
+         → [Apply update]
 ```
+
+Every rank participates in every phase — no rank sits idle. While one rank computes updates for its hosted parameters, other ranks are simultaneously computing their own hosted parameters within the same micro-group.
 
 To avoid stragglers, Canzona introduces **Micro-Group Scheduling**: TP params are organized into micro-groups where each group distributes work across TP ranks in a load-balanced manner. Four scheduling modes:
 
