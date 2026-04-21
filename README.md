@@ -59,7 +59,7 @@ MATRIX_BASED_OPTIM_EXPERT_BUCKET_SIZE=400000000
 export USE_CUDA_GRAPH_OPTIM=1
 ```
 
-The following examples are based on [`scripts/canzona/train.sh`](scripts/canzona/train.sh)
+The following examples are based on [`scripts/canzona/README.md`](scripts/canzona/README.md)
 ```bash
 cd scripts/canzona/
 bash prepare.sh # to prepare example dataset
