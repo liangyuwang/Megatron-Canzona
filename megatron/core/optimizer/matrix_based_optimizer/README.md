@@ -4,18 +4,13 @@
 
 ## Overview
 
-Canzona enables matrix-based optimizers (such as **Muon** and **SOAP**) to run efficiently within Megatron-LM's distributed training framework. The core challenge it solves is the fundamental conflict between these optimizers and Megatron's parallelism:
+Canzona enables matrix-based optimizers (such as **Muon** and **SOAP**) to run efficiently within Megatron-LM's distributed training framework. The core challenge is that matrix-based optimizers have fundamentally different requirements from first-order methods:
 
-- **Matrix-based optimizers** require complete (non-sharded) weight matrices to compute preconditioners or orthogonalization (e.g., Newton-Schulz iteration in Muon, eigen-decomposition in SOAP).
-- **Megatron's Tensor Parallelism (TP)** splits weight matrices across GPUs, fragmenting the data the optimizer needs.
+- **Full-matrix requirement** — preconditioners and orthogonalization (e.g., Newton-Schulz iteration, eigen-decomposition) operate on complete 2D weight matrices, but Megatron's ZeRO-1 and TP partitions them across GPUs.
+- **Computational heterogeneity** — matrix-based updates incur significantly higher per-parameter cost than Adam, causing severe load imbalance across DP ranks under ZeRO-1's default partitioning strategy.
+- **Selective applicability** — only 2D weight matrices benefit from second-order optimization; embeddings, biases, and MoE routing weights are more efficiently handled by Adam.
 
-Existing workarounds suffer from either computational redundancy (synchronous gathering) or load imbalance (naive per-layer partitioning). Canzona resolves this by **decoupling logical optimizer assignment from physical parameter distribution**.
-
-## Results
-
-Evaluated on Qwen3 models (up to 32B parameters) on 256 GPUs:
-- **1.57x speedup** in end-to-end iteration time
-- **5.8x reduction** in optimizer step latency vs. baseline
+Existing workarounds suffer from computational redundancy (synchronous full-matrix reconstruction), communication inefficiency (uncoalesced per-parameter communication), or load imbalance (naive per-layer partitioning). Canzona resolves these conflicts by **decoupling logical optimizer assignment from physical parameter distribution** — introducing load-balanced DP partitioning, async TP micro-group scheduling, and parameter splitting so that matrix-based optimization scales to hundreds of GPUs without stragglers.
 
 ## Architecture
 

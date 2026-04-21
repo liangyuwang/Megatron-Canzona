@@ -14,7 +14,7 @@ Megatron-Canzona
 
 ![Canzona Overview](images/canzona-overview.png)
 
-<div align="left">
+</div>
 
 Canzona enables matrix-based optimizers such as **Muon** and **SOAP** to run efficiently within Megatron's multi-dimensional parallelism (DP, TP, PP, EP). These optimizers require complete (non-sharded) weight matrices to compute preconditioners or orthogonalization, but Megatron's Tensor Parallelism and Distributed Optimizer fragment parameters across GPUs. Canzona resolves this by decoupling logical optimizer assignment from physical parameter distribution — introducing load-balanced DP partitioning, async TP micro-group scheduling, parameter splitting, and bucket regrouping so that matrix-based optimization scales to hundreds of GPUs without stragglers.
 
