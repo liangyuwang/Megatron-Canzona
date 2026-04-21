@@ -96,7 +96,7 @@ In Megatron's Distributed Optimizer (ZeRO-1), gradients are reduce-scattered and
 ┌─────────────────────────────────────────┐
 │  Bucket (total gradient buffer)         │
 │  ┌───┬───┬───┬───┬───┬───┬───┬───┐      │
-│  │ 0 │ 1 │ 2 │ 0 │ 2 │ 1 │ 0 │ 1 │      │  DP ranks
+│  │ 0 │ 0 │ 0 │ 1 │ 1 │ 2 │ 2 │ 2 │      │  DP ranks
 │  └───┴───┴───┴───┴───┴───┴───┴───┘      │
 │                                         │
 │  Greedy LPT: each bucket sliced at      │
