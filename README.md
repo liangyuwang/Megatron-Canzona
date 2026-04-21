@@ -80,6 +80,19 @@ export MODEL_SIZE=1B # Dense 1B to 32B, MoE 7B-A1B to 235B-A22B
 BATCH_SIZE=4 MP_SIZE=4 TRAIN_STEPS=100000 GLOBAL_BATCH_SIZE=128 SAVE_INTERVAL=100000 bash train.sh
 ```
 
+## Citation
+
+If you use Canzona in your work, please cite:
+
+```bibtex
+@article{wang2026canzona,
+  title={Canzona: A Unified, Asynchronous, and Load-Balanced Framework for Distributed Matrix-based Optimizers},
+  author={Wang, Liangyu and Zhang, Siqi and Wang, Junjie and Dong, Yiming and Zheng, Bo and Qiu, Zihan and Tang, Shengkun and Wang, Di and Men, Rui and Liu, Dayiheng},
+  journal={arXiv preprint arXiv:2602.06079},
+  year={2026}
+}
+```
+
 <div align="center">
 
 ---

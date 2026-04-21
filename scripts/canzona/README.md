@@ -1,4 +1,4 @@
-# Canzona Scripts
+# Canzona Example Scripts
 
 ## Scripts Overview
 
@@ -6,7 +6,7 @@
 |--------|-------------|
 | `prepare.sh` | Downloads WikiText-103 from HuggingFace, converts to Megatron binary format, and prepares GPT2 tokenizer. |
 | `train.sh` | Training launch script. Supports Dense (1B to 32B) and MoE (7B-A1B to 235B-A22B) models via `MODEL_SIZE`. All Canzona features are controlled through environment variables. |
-| `bucket_size_calculator.py` | Calculates recommended bucket sizes based on your model configuration. Run it before training to tune `MATRIX_BASED_OPTIM_DENSE_BUCKET_SIZE` and `MATRIX_BASED_OPTIM_EXPERT_BUCKET_SIZE`. |
+| `bucket_size_calculator.py` | Calculates recommended bucket sizes based on your model configuration. Run it before training to tune `MATRIX_BASED_OPTIM_EXPERT_BUCKET_SIZE`. |
 
 ## Usage
 
@@ -29,6 +29,8 @@ export MATRIX_BASED_OPTIM_EXPERT_BUCKET_SIZE=400000000 # expert buffer bucket si
 export MODEL_SIZE=1B # Dense 1B to 32B, MoE 7B-A1B to 235B-A22B
 BATCH_SIZE=4 MP_SIZE=4 EP_SIZE=1 PP_SIZE=1 TRAIN_STEPS=100000 GLOBAL_BATCH_SIZE=128 SAVE_INTERVAL=100000 bash train.sh
 ```
+
+## Tests
 
 You can run the following tests to verify the precision
 ```bash

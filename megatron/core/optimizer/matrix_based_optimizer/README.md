@@ -265,14 +265,14 @@ export MATRIX_BASED_OPTIM_EXPERT_BUCKET_SIZE=400000000
 
 ## Example Scripts
 
-See `scripts/canzona/` for reference training scripts:
+See [`scripts/canzona/README.md`](../../../../scripts/canzona/README.md) for reference training scripts:
 - `scripts/canzona/prepare.sh` — Environment preparation
 - `scripts/canzona/train.sh` — Training launch script
 
 ## Roadmap
 
-- **HSDP (Hybrid Sharded Data Parallel)** — extend DP load-balancing to hybrid sharding topologies (DP × FSDP).
-- **More Optimizers** — additional matrix-based optimizers via the plugin API.
-- **Higher-Performance Communication Primitives** — custom fused all-gather-v / reduce-scatter-v kernels to replace generic PyTorch collectives for uneven bucket communication.
-- **FSDP Compatibility** — support matrix-based optimizers under `--use-megatron-fsdp` and `--use-torch-fsdp2`.
-- **Checkpointing:** Support more sharding types, not only `fully_sharded_model_space`.
+- **HSDP (Hybrid Sharded Data Parallel)** — In scenarios with large DP size and small model parameter count, the number of load-balance "chunks" is insufficient — too few parameters to distribute evenly across many DP ranks. HSDP extends DP load-balancing to hybrid sharding topologies (DP × FSDP), enabling finer-grained partitioning by treating per-shard parameters as the balancing unit rather than full-model parameters, thereby improving load balance in wide-but-shallow configurations.
+- **Parameter-Splitting-Aware Load Balancing** — The "Parameter Splitting" feature already breaks large weight matrices (e.g., QKV, FC1) into smaller sub-matrices. Currently, DP load-balancing operates at the original parameter granularity, leaving the extra granularity from splitting on the table. Future work will propagate split-level information to the load-balancer so that sub-parameters can be independently assigned to DP ranks, enabling finer-grained scheduling and better load balance.
+- **More Optimizers** — the plugin API (`optimizers/base_opt.py`) defines a minimal interface that matrix-based optimizers must implement. This enables third-party or research optimizers to plug into Canzona without modifying the distributed optimizer core. Planned integrations include SSO and other second-order methods.
+- **Higher-Performance Communication Primitives** — uneven buckets (where DP ranks receive shards of different sizes) are currently handled by coalesced custom `all-gather-v` / `reduce-scatter-v` operations, which satisfy the functional requirements. There is still room for further optimization through more efficient kernel scheduling.
+- **Checkpointing** — `DistMatrixBasedOptimizer` currently only supports `fully_sharded_model_space` sharding for checkpoint save/restore. Future work will add support for `dp_reshardable` and `fully_reshardable` sharding modes, enabling checkpoint restoration across different DP/TP/PP configurations without requiring manual state resharding. This is critical for elastic training where cluster topology may differ between runs.
