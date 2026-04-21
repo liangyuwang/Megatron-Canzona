@@ -360,7 +360,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                 if args.moe_shared_expert_intermediate_size is not None:
                     shared_expert_fc1_shape = [args.moe_shared_expert_intermediate_size // tp_size, args.moe_shared_expert_intermediate_size // tp_size]
                     split_matrix_based_optimizer_shape_map['is_shared_expert_fc1'] = shared_expert_fc1_shape
-                expert_fc1_shape = [args.ffn_hidden_size // tp_size, args.ffn_hidden_size // tp_size]
+                expert_fc1_shape = [args.moe_ffn_hidden_size // tp_size, args.moe_ffn_hidden_size // tp_size]
                 split_matrix_based_optimizer_shape_map['is_expert_fc1'] = expert_fc1_shape
             else:
                 split_matrix_based_optimizer_shape_map['is_mlp_fc1'] = [args.ffn_hidden_size // tp_size, args.ffn_hidden_size // tp_size]
