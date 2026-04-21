@@ -81,7 +81,15 @@ Canzona does not replace all optimizers with matrix-based ones. Instead, it inte
 - **Matrix-based (Muon/SOAP):** 2D weight matrices (e.g., `linear_qkv.weight`, `linear_fc1.weight`) that benefit from second-order information. Embeddings (`word_embeddings`), output layers (`output_layer`), and MoE routers (`router`, `gate_weight`) are excluded.
 - **Adam:** All other parameters (embeddings, 1D biases, MoE router weights, etc.).
 
-This is achieved by tagging parameters in `_get_param_groups()` based on their names and the `is_param_use_matrix_based_optim()` predicate. The optimizer then creates separate param groups with `use_muon` or `use_soap` flags.
+This is achieved by tagging parameters in `_get_param_groups()` based on the `is_param_use_matrix_based_optim()` predicate from [`utils.py`](utils.py). A parameter qualifies for matrix-based optimization if:
+
+1. It is exactly 2-dimensional (`param.ndim == 2`), matching the shape requirement for Newton-Schulz iteration or eigen-decomposition.
+2. Its name does **not** contain any of the following substrings:
+   - `word_embeddings` — embedding matrices are typically very large and sparse, making matrix-based methods less effective.
+   - `output_layer` — the final projection layer maps hidden states to vocabulary (often 100K+), where matrix-based optimization is prohibitively expensive.
+   - `router` / `gate_weight` — MoE routing weights are lightweight parameters that don't benefit from second-order methods.
+
+The optimizer then creates separate param groups with `use_muon` or `use_soap` flags, while all remaining parameters fall into the default Adam group.
 
 ### 2. Data Parallelism: Load-Balanced Partitioning (`load_balanced_dp_buffer.py`)
 
