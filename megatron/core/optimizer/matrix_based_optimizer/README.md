@@ -159,14 +159,16 @@ The `GradAndStateSplitter` handles splitting gradients into 2D sub-fragments bef
 
 ### 5. Adaptive Bucket Sizing (`param_and_grad_buffer.py`, `comm_extension/`)
 
-Canzona adjusts bucket boundaries so each DP rank receives an equal share of parameters, maximizing **even buckets** — where every DP rank gets an identical shard size. Even buckets use fast native PyTorch collectives (`all_gather_into_tensor`, `reduce_scatter_tensor`), while remaining **uneven buckets** fall back to coalesced custom `all-gather-v` / `reduce-scatter-v` primitives from [`comm_extension/`](./comm_extension/).
+In Megatron's Distributed Optimizer, parameters are partitioned into buckets for all-gather and reduce-scatter. The goal of adaptive bucket sizing is to choose a bucket size that allows each bucket to contain at least `DP_size` equally-sized **param units** — where each unit is one or more complete parameters (in the DP dimension). When this condition holds, every DP rank receives an identical shard, enabling fast native PyTorch collectives (`all_gather_into_tensor`, `reduce_scatter_tensor`).
 
-The `_MatrixBasedParamAndGradBucketGroup._classify_buckets()` method checks whether all shards within a bucket have equal size:
+However, when DP size is very large or the model is relatively small, it may be impossible to find enough equally-sized units within any bucket. In such cases, the bucket becomes **uneven** — shards differ in size across ranks — and falls back to coalesced custom `all-gather-v` / `reduce-scatter-v` primitives from [`comm_extension/`](./comm_extension/).
+
+Buckets are classified into `even_buckets` and `uneven_buckets` by `_MatrixBasedParamAndGradBucketGroup._classify_buckets()`, which checks whether all shards within a bucket have equal size:
 ```python
 even_shard = len(set([r.end - r.start for r in bucket.real_gbuf_world_ranges])) == 1
 ```
 
-Buckets are classified into `even_buckets` and `uneven_buckets`, allowing different communication paths to run in parallel via `torch.distributed._coalescing_manager`. Bucket size is controlled via environment variables `MATRIX_BASED_OPTIM_DENSE_BUCKET_SIZE` and `MATRIX_BASED_OPTIM_EXPERT_BUCKET_SIZE`.
+The two types of buckets run in parallel via `torch.distributed._coalescing_manager`. Bucket size is controlled via environment variables `MATRIX_BASED_OPTIM_DENSE_BUCKET_SIZE` and `MATRIX_BASED_OPTIM_EXPERT_BUCKET_SIZE`. Expert parameters are managed in a separate buffer (see `megatron/core/optimizer/__init__.py`), so they have independent bucket sizing from dense parameters. In practice, tuning `MATRIX_BASED_OPTIM_EXPERT_BUCKET_SIZE` is usually more impactful — expert parameters are stored in a dedicated buffer, tend to have identical shapes, and appear in greater numbers, making it significantly easier to form even buckets.
 
 ### 6. Distributed Checkpointing
 
