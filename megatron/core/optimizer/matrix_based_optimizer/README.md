@@ -22,18 +22,18 @@ Evaluated on Qwen3 models (up to 32B parameters) on 256 GPUs:
 ```
                     Canzona Module Structure
    ┌─────────────────────────────────────────────────────────┐
-   │                    Megatron Training                     │
+   │                    Megatron Training                    │
    │  ┌─────────────────────────────────────────────────┐    │
-   │  │           ChainedOptimizer                        │    │
+   │  │                 ChainedOptimizer                │    │
    │  │  ┌─────────────────┐ ┌───────────────────────┐  │    │
    │  │  │  Dense Optim    │ │ MoE Expert-Parallel   │  │    │
    │  │  │  (Adam + Muon/  │ │  (Muon/SOAP + Adam)   │  │    │
-   │  │  │  SOAP mixed)    │ │                        │  │    │
+   │  │  │  SOAP mixed)    │ │                       │  │    │
    │  │  └────────┬────────┘ └───────────┬───────────┘  │    │
    │  └───────────┼──────────────────────┼──────────────┘    │
    │              │                      │                   │
    │  ┌───────────▼──────────────────────▼───────────────┐   │
-   │  │          DistMatrixBasedOptimizer                 │   │
+   │  │           DistMatrixBasedOptimizer               │   │
    │  │  ┌────────────────────────┐ ┌─────────────────┐  │   │
    │  │  │ DP: Load-Balanced      │ │ TP: Async       │  │   │
    │  │  │   Partitioning         │ │   Micro-Group   │  │   │
@@ -42,13 +42,13 @@ Evaluated on Qwen3 models (up to 32B parameters) on 256 GPUs:
    │  └──────────────────────┬───────────────────────────┘   │
    │                         │                               │
    │  ┌──────────────────────▼───────────────────────────┐   │
-   │  │          Matrix-Based Optimizers                  │   │
-   │  │  ┌──────────────┐          ┌──────────────────┐   │   │
-   │  │  │  Muon        │          │  SOAP            │   │   │
-   │  │  │ (NS iters +  │          │ (Adam + Shampoo  │   │   │
-   │  │  │  momentum)   │          │  preconditioner) │   │   │
-   │  │  └──────────────┘          └──────────────────┘   │   │
-   │  └───────────────────────────────────────────────────┘   │
+   │  │            Matrix-Based Optimizers               │   │
+   │  │  ┌──────────────┐          ┌──────────────────┐  │   │
+   │  │  │  Muon        │          │  SOAP            │  │   │
+   │  │  │ (NS iters +  │          │ (Adam + Shampoo  │  │   │
+   │  │  │  momentum)   │          │  preconditioner) │  │   │
+   │  │  └──────────────┘          └──────────────────┘  │   │
+   │  └──────────────────────────────────────────────────┘   │
    └─────────────────────────────────────────────────────────┘
 ```
 
@@ -91,15 +91,15 @@ In Megatron's Distributed Optimizer (ZeRO-1), gradients are reduce-scattered and
 
 ```
 ┌─────────────────────────────────────────┐
-│  Bucket (total gradient buffer)          │
-│  ┌───┬───┬───┬───┬───┬───┬───┬───┐     │
-│  │ 0 │ 1 │ 2 │ 0 │ 2 │ 1 │ 0 │ 1 │     │  DP ranks
-│  └───┴───┴───┴───┴───┴───┴───┴───┘     │
-│                                          │
-│  Greedy LPT: each bucket sliced at       │
-│  param boundaries to balance load        │
-│  across ranks while keeping params        │
-│  atomic (no param split across ranks)    │
+│  Bucket (total gradient buffer)         │
+│  ┌───┬───┬───┬───┬───┬───┬───┬───┐      │
+│  │ 0 │ 1 │ 2 │ 0 │ 2 │ 1 │ 0 │ 1 │      │  DP ranks
+│  └───┴───┴───┴───┴───┴───┴───┴───┘      │
+│                                         │
+│  Greedy LPT: each bucket sliced at      │
+│  param boundaries to balance load       │
+│  across ranks while keeping params      │
+│  atomic (no param split across ranks)   │
 └─────────────────────────────────────────┘
 ```
 
@@ -203,17 +203,17 @@ Combines Adam with Shampoo-style preconditioning via eigenvalue decomposition of
 --use-dp-balanced-opt
 --dp-balanced-opt-alpha 1.0          # 1.0 = pure DP balance, 0.0 = pure comm balance
 --dp-balanced-opt-cost flops         # "numel" or "flops"
---dp-balanced-opt-log-visualization  # Output balance visualization to log
+--dp-balanced-opt-log-visualization  # Output dp-balance visualization to log
 
 # TP async (enabled by default for matrix-based optimizers)
-# --use-tp-sync-opt                  # Use this flag to DISABLE async TP
+--use-tp-sync-opt                   # Use this flag to DISABLE async TP
 --no-async-tp-fuse-comm             # Disable fused all-to-all communication
 
 # TP load-balanced micro-group scheduling
 --use-tp-balanced-opt               # Enable TP load-balanced scheduling
 --tp-balanced-opt-cost flops        # "numel" or "flops"
 --tp-balanced-opt-fuse-space 400    # Max slot size in MB
---tp-balanced-opt-log-visualization
+--tp-balanced-opt-log-visualization # Output tp-balance visualization to log
 ```
 
 ### CUDA Graph
