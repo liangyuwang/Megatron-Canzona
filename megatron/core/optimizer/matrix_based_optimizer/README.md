@@ -170,6 +170,12 @@ even_shard = len(set([r.end - r.start for r in bucket.real_gbuf_world_ranges])) 
 
 The two types of buckets run in parallel via `torch.distributed._coalescing_manager`. Bucket size is controlled via environment variables `MATRIX_BASED_OPTIM_DENSE_BUCKET_SIZE` and `MATRIX_BASED_OPTIM_EXPERT_BUCKET_SIZE`. Expert parameters are managed in a separate buffer (see `megatron/core/optimizer/__init__.py`), so they have independent bucket sizing from dense parameters. In practice, tuning `MATRIX_BASED_OPTIM_EXPERT_BUCKET_SIZE` is usually more impactful — expert parameters are stored in a dedicated buffer, tend to have identical shapes, and appear in greater numbers, making it significantly easier to form even buckets. The goal is to ensure each expert bucket contains at least `EDP_size` equally-sized **expert units** — where each unit spans one or more complete experts (or finer-grained components like individual FC layers within an expert).
 
+**Verification:** At startup, the log will print a line like:
+```
+DP Bucket classification [matrix_based_expert_buffer]: 4 even bucket(s), 1 uneven bucket(s) (total: 5)
+```
+The appearance of `x even bucket(s)` (where `x >= 1`) confirms that even buckets have been successfully formed.
+
 ### 6. Distributed Checkpointing
 
 `DistMatrixBasedOptimizer` implements `sharded_state_dict()` with `fully_sharded_model_space` sharding. Optimizer states (momentum buffers, preconditioner matrices, etc.) are saved per-param-shard and can be reloaded at different DP/TP configurations. The `sharded_param_state_fs_model_space()` method handles the mapping between model param shards and their optimizer states, including special handling for TP-sharded parameters.
