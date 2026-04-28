@@ -22,9 +22,83 @@ from ...distributed.param_and_grad_buffer import (
     shard_buffer,
 )
 
-from .comm_extension import coalesced_allgather, coalesced_reduce_scatter
+from .comm_extension import (
+    coalesced_allgather,
+    coalesced_reduce_scatter,
+    prepare_padded_allgather,
+    prepare_padded_reduce_scatter,
+)
 
 logger = logging.getLogger(__name__)
+
+
+class _CombinedWork:
+    """Wait on multiple c10d work handles as a single handle."""
+
+    def __init__(self, handles):
+        self._handles = [handle for handle in handles if handle is not None]
+
+    def wait(self, *args, **kwargs):
+        for handle in self._handles:
+            handle.wait(*args, **kwargs)
+        return True
+
+    def is_completed(self):
+        return all(handle.is_completed() for handle in self._handles)
+
+
+class _FinalizeCoalescedWork:
+    """Finalize padded collectives on their launch streams and chain them to the caller."""
+
+    def __init__(self, handle, plans):
+        self._handle = handle
+        self._plans = plans
+        self._finalized = False
+        self._done_events = []
+
+    def _enqueue_finalize(self):
+        stream_groups = {}
+        for plan in self._plans:
+            stream = getattr(plan, "launch_stream", None)
+            device = getattr(plan, "device", None)
+            if stream is None or device is None or device.type != "cuda":
+                plan.finalize()
+                continue
+
+            key = (device.index, stream.cuda_stream)
+            group = stream_groups.setdefault(
+                key, {"device": device, "stream": stream, "plans": []}
+            )
+            group["plans"].append(plan)
+
+        done_events = []
+        for group in stream_groups.values():
+            with torch.cuda.stream(group["stream"]):
+                for plan in group["plans"]:
+                    plan.finalize()
+                event = torch.cuda.Event()
+                event.record(group["stream"])
+            done_events.append((group["device"], event))
+
+        return done_events
+
+    def wait(self, *args, **kwargs):
+        if self._handle is not None:
+            self._handle.wait(*args, **kwargs)
+        if not self._finalized:
+            self._done_events = self._enqueue_finalize()
+            self._finalized = True
+        for device, event in self._done_events:
+            torch.cuda.current_stream(device).wait_event(event)
+        return True
+
+    def is_completed(self):
+        if not self._finalized:
+            return False
+        if self._handle is not None and not hasattr(self._handle, "is_completed"):
+            return False
+        handle_completed = self._handle is None or self._handle.is_completed()
+        return handle_completed and all(event.query() for _, event in self._done_events)
 
 
 class _MatrixBasedParamAndGradBucketGroup(_ParamAndGradBucketGroup):
@@ -69,6 +143,174 @@ class _MatrixBasedParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         
         self._buckets_classified = True
 
+    def _get_uneven_collective_strategy(self) -> str:
+        # Strategy choices for uneven DP shards:
+        # - "uneven": keep the custom uneven-size collectives and isolate them from
+        #   c10d's Python fast-path by running them in a separate coalescing block.
+        # - "padded": pad uneven shards up to a common length so both uneven and
+        #   even buckets can use the same tensor-collective fast-path.
+        # Default to "uneven" because it stays closest to the original data
+        # movement pattern and avoids the extra padding/copy overhead.
+        strategy = getattr(self.ddp_config, "uneven_collective_strategy", "uneven")
+        if strategy not in {"uneven", "padded"}:
+            raise ValueError(
+                "ddp_config.uneven_collective_strategy must be 'uneven' or 'padded', "
+                f"got {strategy!r}"
+            )
+        return strategy
+
+    def _start_param_sync_uneven(self, async_op: bool, data_parallel_rank, data_parallel_group):
+        handles = []
+        device = self.buckets[0].param_data.device
+        with _coalescing_manager(data_parallel_group, device=device, async_ops=async_op) as cm:
+            for bucket in self.uneven_buckets:
+                total_data_view = [
+                    bucket.param_data[r.start - bucket.offset : r.end - bucket.offset]
+                    for r in bucket.real_gbuf_world_ranges
+                ]
+                local_data_view = bucket.param_data[
+                    bucket.real_gbuf_world_ranges[data_parallel_rank].start - bucket.offset :
+                    bucket.real_gbuf_world_ranges[data_parallel_rank].end - bucket.offset
+                ]
+                coalesced_allgather(
+                    total_data_view, local_data_view, data_parallel_group, async_op
+                )
+        handles.extend(cm.works)
+
+        with _coalescing_manager(data_parallel_group, async_ops=async_op) as cm:
+            for idx, bucket in enumerate(self.even_buckets):
+                if self.cached_param_buffer_shard_list[idx] is None:
+                    self.cached_param_buffer_shard_list[idx] = shard_buffer(
+                        bucket.param_data, torch.distributed.get_world_size(data_parallel_group)
+                    )
+                local_data_view = self.cached_param_buffer_shard_list[idx][data_parallel_rank]
+                dist_all_gather_func(
+                    bucket.param_data,
+                    local_data_view,
+                    group=data_parallel_group,
+                    async_op=async_op,
+                )
+        handles.extend(cm.works)
+        return _CombinedWork(handles) if async_op and handles else None
+
+    def _start_param_sync_padded(self, async_op: bool, data_parallel_rank, data_parallel_group):
+        padded_plans = []
+        with _coalescing_manager(data_parallel_group, async_ops=async_op) as cm:
+            for bucket in self.uneven_buckets:
+                total_data_view = [
+                    bucket.param_data[r.start - bucket.offset : r.end - bucket.offset]
+                    for r in bucket.real_gbuf_world_ranges
+                ]
+                local_data_view = bucket.param_data[
+                    bucket.real_gbuf_world_ranges[data_parallel_rank].start - bucket.offset :
+                    bucket.real_gbuf_world_ranges[data_parallel_rank].end - bucket.offset
+                ]
+                plan = prepare_padded_allgather(total_data_view, local_data_view)
+                plan.run(data_parallel_group, async_op=async_op)
+                padded_plans.append(plan)
+            for idx, bucket in enumerate(self.even_buckets):
+                if self.cached_param_buffer_shard_list[idx] is None:
+                    self.cached_param_buffer_shard_list[idx] = shard_buffer(
+                        bucket.param_data, torch.distributed.get_world_size(data_parallel_group)
+                    )
+                local_data_view = self.cached_param_buffer_shard_list[idx][
+                    data_parallel_rank
+                ]
+                dist_all_gather_func(
+                    bucket.param_data,
+                    local_data_view,
+                    group=data_parallel_group,
+                    async_op=async_op,
+                )
+        if async_op:
+            return _FinalizeCoalescedWork(cm, padded_plans)
+        for plan in padded_plans:
+            plan.finalize()
+        return None
+
+    def _start_grad_sync_uneven(self, stream_context, async_op: bool, reduce_op, data_parallel_rank, data_parallel_group):
+        handles = []
+        device = self.buckets[0].grad_data.device
+        with stream_context, _coalescing_manager(self.data_parallel_group, device=device, async_ops=async_op) as cm:
+            for bucket in self.uneven_buckets:
+                total_data_view = [
+                    bucket.grad_data[r.start - bucket.offset : r.end - bucket.offset]
+                    for r in bucket.real_gbuf_world_ranges
+                ]
+                local_data_view = bucket.grad_data[
+                    bucket.real_gbuf_world_ranges[data_parallel_rank].start - bucket.offset :
+                    bucket.real_gbuf_world_ranges[data_parallel_rank].end - bucket.offset
+                ]
+                coalesced_reduce_scatter(
+                    local_data_view,
+                    total_data_view,
+                    data_parallel_group,
+                    reduce_op,
+                    async_op,
+                )
+        handles.extend(cm.works)
+
+        with stream_context, _coalescing_manager(data_parallel_group, async_ops=async_op) as cm:
+            for idx, bucket in enumerate(self.even_buckets):
+                if self.ddp_config.use_distributed_optimizer:
+                    if self.cached_grad_buffer_shard_list[idx] is None:
+                        self.cached_grad_buffer_shard_list[idx] = shard_buffer(
+                            bucket.grad_data, torch.distributed.get_world_size(data_parallel_group)
+                        )
+                    local_data_view = self.cached_grad_buffer_shard_list[idx][data_parallel_rank]
+                    dist_reduce_scatter_func(
+                        local_data_view,
+                        bucket.grad_data,
+                        op=reduce_op,
+                        group=data_parallel_group,
+                        async_op=async_op,
+                    )
+                else:
+                    torch.distributed.all_reduce(
+                        bucket.grad_data, op=reduce_op, group=data_parallel_group, async_op=async_op
+                    )
+        handles.extend(cm.works)
+        return _CombinedWork(handles) if async_op and handles else None
+
+    def _start_grad_sync_padded(self, stream_context, async_op: bool, reduce_op, data_parallel_rank, data_parallel_group):
+        padded_plans = []
+        with stream_context, _coalescing_manager(self.data_parallel_group, async_ops=async_op) as cm:
+            for bucket in self.uneven_buckets:
+                total_data_view = [
+                    bucket.grad_data[r.start - bucket.offset : r.end - bucket.offset]
+                    for r in bucket.real_gbuf_world_ranges
+                ]
+                local_data_view = bucket.grad_data[
+                    bucket.real_gbuf_world_ranges[data_parallel_rank].start - bucket.offset :
+                    bucket.real_gbuf_world_ranges[data_parallel_rank].end - bucket.offset
+                ]
+                plan = prepare_padded_reduce_scatter(local_data_view, total_data_view)
+                plan.run(data_parallel_group, reduce_op, async_op=async_op)
+                padded_plans.append(plan)
+            for idx, bucket in enumerate(self.even_buckets):
+                if self.ddp_config.use_distributed_optimizer:
+                    if self.cached_grad_buffer_shard_list[idx] is None:
+                        self.cached_grad_buffer_shard_list[idx] = shard_buffer(
+                            bucket.grad_data, torch.distributed.get_world_size(data_parallel_group)
+                        )
+                    local_data_view = self.cached_grad_buffer_shard_list[idx][data_parallel_rank]
+                    dist_reduce_scatter_func(
+                        local_data_view,
+                        bucket.grad_data,
+                        op=reduce_op,
+                        group=data_parallel_group,
+                        async_op=async_op,
+                    )
+                else:
+                    torch.distributed.all_reduce(
+                        bucket.grad_data, op=reduce_op, group=data_parallel_group, async_op=async_op
+                    )
+        if async_op:
+            return _FinalizeCoalescedWork(cm, padded_plans)
+        for plan in padded_plans:
+            plan.finalize()
+        return None
+
     def start_param_sync(self, force_sync: bool = False):
         """
         Initiates all necessary param all-gathers for this bucket.
@@ -94,36 +336,12 @@ class _MatrixBasedParamAndGradBucketGroup(_ParamAndGradBucketGroup):
 
         async_op = self.ddp_config.overlap_param_gather and not force_sync
         
-        device = self.buckets[0].param_data.device
         self._classify_buckets()
-        with _coalescing_manager(self.intra_distributed_optimizer_instance_group, device=device, async_ops=async_op) as cm:
-            for bucket in self.uneven_buckets:
-                total_data_view = [bucket.param_data[r.start - bucket.offset: r.end - bucket.offset] for r in bucket.real_gbuf_world_ranges]
-                local_data_view = bucket.param_data[bucket.real_gbuf_world_ranges[data_parallel_rank].start - bucket.offset : bucket.real_gbuf_world_ranges[data_parallel_rank].end - bucket.offset]
-                coalesced_allgather(total_data_view, local_data_view, self.intra_distributed_optimizer_instance_group, async_op)
-            for idx, bucket in enumerate(self.even_buckets):
-                if self.cached_param_buffer_shard_list[idx] is None:
-                    self.cached_param_buffer_shard_list[idx] = shard_buffer(
-                        bucket.param_data, self.intra_distributed_optimizer_instance_size
-                    )
-                local_data_view = self.cached_param_buffer_shard_list[idx][
-                    self.intra_distributed_optimizer_instance_rank
-                ]
-                dist_all_gather_func(
-                    bucket.param_data,
-                    local_data_view,
-                    group=self.intra_distributed_optimizer_instance_group,
-                    async_op=async_op,
-                )
-        if async_op:
-            self.param_gather_handle = cm
+        strategy = self._get_uneven_collective_strategy()
+        if strategy == "uneven":
+            self.param_gather_handle = self._start_param_sync_uneven(async_op, data_parallel_rank, self.intra_distributed_optimizer_instance_group)
         else:
-            # When using `_coalescing_manager`, even if a synchronous op (async_op=False) is used,
-            # `cm` is not None, which is different from when `_coalescing_manager` is not used in
-            # which case the torch.distributed._all_gather_base() will return None. In order to
-            # maintain consistency with prior code, we need to manually set communication handle to
-            # None.
-            self.param_gather_handle = None
+            self.param_gather_handle = self._start_param_sync_padded(async_op, data_parallel_rank, self.intra_distributed_optimizer_instance_group)
         self.param_gather_dispatched = True
     
     def finish_param_sync(self, skip_next_bucket_dispatch: bool = False):
@@ -244,49 +462,12 @@ class _MatrixBasedParamAndGradBucketGroup(_ParamAndGradBucketGroup):
 
         data_parallel_rank = torch.distributed.get_rank(group=communication_group)
 
-        device = self.buckets[0].grad_data.device
         self._classify_buckets()
-        with stream_context, _coalescing_manager(communication_group, device=device, async_ops=async_op) as cm:
-            for bucket in self.uneven_buckets:
-                # TODO: Verify compatibility with Hybrid DDP (Intra-group ReduceScatter).
-                # Issue: If `real_gbuf_world_ranges` contains ranges for the GLOBAL world size 
-                # (e.g., 16 ranks) but we are currently performing an INTRA-group RS 
-                # (e.g., group size 8), `total_data_view` will have length 16.
-                # PyTorch's `reduce_scatter` will throw an error if input list length != group size.
-                # Fix: If this is the case, we need to slice `bucket.real_gbuf_world_ranges` 
-                # to only include the ranges corresponding to the current intra-group ranks.
-                total_data_view = [bucket.grad_data[r.start - bucket.offset: r.end - bucket.offset] for r in bucket.real_gbuf_world_ranges]
-                local_data_view = bucket.grad_data[bucket.real_gbuf_world_ranges[data_parallel_rank].start - bucket.offset : bucket.real_gbuf_world_ranges[data_parallel_rank].end - bucket.offset]
-                coalesced_reduce_scatter(local_data_view, total_data_view, self.intra_distributed_optimizer_instance_group, reduce_op, async_op)
-            for idx, bucket in enumerate(self.even_buckets):
-                if self.ddp_config.use_distributed_optimizer:
-                    if self.cached_grad_buffer_shard_list[idx] is None:
-                        self.cached_grad_buffer_shard_list[idx] = shard_buffer(
-                            bucket.grad_data, self.intra_distributed_optimizer_instance_size
-                        )
-                    local_data_view = self.cached_grad_buffer_shard_list[idx][
-                        self.intra_distributed_optimizer_instance_rank
-                    ]
-                    dist_reduce_scatter_func(
-                        local_data_view,
-                        bucket.grad_data,
-                        op=reduce_op,
-                        group=communication_group,
-                        async_op=async_op,
-                    )
-                else:
-                    torch.distributed.all_reduce(
-                        bucket.grad_data, op=reduce_op, group=communication_group, async_op=async_op
-                    )
-        if async_op:
-            self.grad_reduce_handle = cm
+        strategy = self._get_uneven_collective_strategy()
+        if strategy == "uneven":
+            self.grad_reduce_handle = self._start_grad_sync_uneven(stream_context, async_op, reduce_op, data_parallel_rank, communication_group)
         else:
-            # When using `_coalescing_manager`, even if a synchronous op (async_op=False) is used,
-            # `cm` is not None, which is different from when `_coalescing_manager` is not used in
-            # which case the torch.distributed._reduce_scatter_base() will return None. In order to
-            # maintain consistency with prior code, we need to manually set communication handle to
-            # None.
-            self.grad_reduce_handle = None
+            self.grad_reduce_handle = self._start_grad_sync_padded(stream_context, async_op, reduce_op, data_parallel_rank, communication_group)
 
         # With multiple DistOpt instances, we need to all-reduce across instances.
         if (
