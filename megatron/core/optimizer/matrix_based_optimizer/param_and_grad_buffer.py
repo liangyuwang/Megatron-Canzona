@@ -1,5 +1,9 @@
 import torch
 from torch.distributed import _coalescing_manager
+
+from megatron.core.utils import is_torch_min_version
+
+import os
 from typing import Dict, List, Optional
 import logging
 import warnings
@@ -151,10 +155,10 @@ class _MatrixBasedParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         #   even buckets can use the same tensor-collective fast-path.
         # Default to "uneven" because it stays closest to the original data
         # movement pattern and avoids the extra padding/copy overhead.
-        strategy = getattr(self.ddp_config, "uneven_collective_strategy", "uneven")
+        strategy = os.environ.get('UNEVEN_COLLECTIVE_STRATEGIES', "uneven")
         if strategy not in {"uneven", "padded"}:
             raise ValueError(
-                "ddp_config.uneven_collective_strategy must be 'uneven' or 'padded', "
+                "UNEVEN_COLLECTIVE_STRATEGIES must be 'uneven' or 'padded', "
                 f"got {strategy!r}"
             )
         return strategy
