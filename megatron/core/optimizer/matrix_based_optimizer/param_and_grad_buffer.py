@@ -235,7 +235,7 @@ class _MatrixBasedParamAndGradBucketGroup(_ParamAndGradBucketGroup):
     def _start_grad_sync_uneven(self, stream_context, async_op: bool, reduce_op, data_parallel_rank, data_parallel_group):
         handles = []
         device = self.buckets[0].grad_data.device
-        with stream_context, _coalescing_manager(self.data_parallel_group, device=device, async_ops=async_op) as cm:
+        with stream_context, _coalescing_manager(data_parallel_group, device=device, async_ops=async_op) as cm:
             for bucket in self.uneven_buckets:
                 total_data_view = [
                     bucket.grad_data[r.start - bucket.offset : r.end - bucket.offset]
@@ -278,7 +278,7 @@ class _MatrixBasedParamAndGradBucketGroup(_ParamAndGradBucketGroup):
 
     def _start_grad_sync_padded(self, stream_context, async_op: bool, reduce_op, data_parallel_rank, data_parallel_group):
         padded_plans = []
-        with stream_context, _coalescing_manager(self.data_parallel_group, async_ops=async_op) as cm:
+        with stream_context, _coalescing_manager(data_parallel_group, async_ops=async_op) as cm:
             for bucket in self.uneven_buckets:
                 total_data_view = [
                     bucket.grad_data[r.start - bucket.offset : r.end - bucket.offset]
