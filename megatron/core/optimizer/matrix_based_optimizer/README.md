@@ -185,7 +185,7 @@ When DP ranks receive shards of different sizes (i.e., **uneven buckets**), Canz
 | `uneven` (default) | Custom `all-gather-v` / `reduce-scatter-v` primitives isolate uneven buckets in a separate coalescing block, keeping the data movement pattern closest to the original and avoiding padding/copy overhead. |
 | `padded` | Pad uneven shards up to a common length so both uneven and even buckets share the same tensor-collective fast-path (`all_gather_into_tensor` / `reduce_scatter_tensor`). Trades extra memory for potentially better kernel utilization. |
 
-Both strategies apply to gradient reduce-scatter (forward) and parameter all-gather (backward) synchronization. The default `uneven` is recommended for most workloads; `padded` may benefit cases where native collective fast-path outweighs the padding cost.
+Both strategies apply to gradient reduce-scatter (forward) and parameter all-gather (backward) synchronization. Neither strategy is universally superior — benchmark both in your actual training setup to determine the better choice.
 
 ### 7. Distributed Checkpointing
 
