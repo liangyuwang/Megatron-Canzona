@@ -155,10 +155,10 @@ class _MatrixBasedParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         #   even buckets can use the same tensor-collective fast-path.
         # Default to "uneven" because it stays closest to the original data
         # movement pattern and avoids the extra padding/copy overhead.
-        strategy = os.environ.get('UNEVEN_COLLECTIVE_STRATEGIES', "uneven")
+        strategy = os.environ.get('UNEVEN_BUCKET_COLLECTIVE_STRATEGY', "uneven")
         if strategy not in {"uneven", "padded"}:
             raise ValueError(
-                "UNEVEN_COLLECTIVE_STRATEGIES must be 'uneven' or 'padded', "
+                "UNEVEN_BUCKET_COLLECTIVE_STRATEGY must be 'uneven' or 'padded', "
                 f"got {strategy!r}"
             )
         return strategy

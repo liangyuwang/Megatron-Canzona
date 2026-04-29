@@ -176,7 +176,18 @@ DP Bucket classification [matrix_based_expert_buffer]: 4 even bucket(s), 1 uneve
 ```
 The appearance of `x even bucket(s)` (where `x >= 1`) confirms that even buckets have been successfully formed.
 
-### 6. Distributed Checkpointing
+### 6. Uneven Bucket Collective Strategy (`param_and_grad_buffer.py`)
+
+When DP ranks receive shards of different sizes (i.e., **uneven buckets**), Canzona supports two communication strategies controlled by the `UNEVEN_BUCKET_COLLECTIVE_STRATEGY` environment variable:
+
+| Strategy | Description |
+|----------|-------------|
+| `uneven` (default) | Custom `all-gather-v` / `reduce-scatter-v` primitives isolate uneven buckets in a separate coalescing block, keeping the data movement pattern closest to the original and avoiding padding/copy overhead. |
+| `padded` | Pad uneven shards up to a common length so both uneven and even buckets share the same tensor-collective fast-path (`all_gather_into_tensor` / `reduce_scatter_tensor`). Trades extra memory for potentially better kernel utilization. |
+
+Both strategies apply to gradient reduce-scatter (forward) and parameter all-gather (backward) synchronization. The default `uneven` is recommended for most workloads; `padded` may benefit cases where native collective fast-path outweighs the padding cost.
+
+### 7. Distributed Checkpointing
 
 `DistMatrixBasedOptimizer` implements `sharded_state_dict()` with `fully_sharded_model_space` sharding. Optimizer states (momentum buffers, preconditioner matrices, etc.) are saved per-param-shard and can be reloaded at different DP/TP configurations. The `sharded_param_state_fs_model_space()` method handles the mapping between model param shards and their optimizer states, including special handling for TP-sharded parameters.
 

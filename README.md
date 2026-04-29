@@ -27,6 +27,7 @@ Canzona enables matrix-based optimizers such as **Muon** and **SOAP** to run eff
 - **Extensible Optimizer Plugin API** — add new matrix-based optimizers by implementing a few abstract methods; see [Adding a New Optimizer](megatron/core/optimizer/matrix_based_optimizer/optimizers/README.md).
 - **CUDA Graph Support** — optional CUDA graph capture for Muon and SOAP compute kernels to reduce kernel launch overhead.
 - **Adaptive DP Bucket Sizing** — adjusts bucket boundaries so each DP rank receives an equal share, maximizing *even* (uniform) buckets that use fast native collectives; remaining *uneven* buckets fall back to coalesced custom reduce-scatter/all-gather.
+- **Uneven Collective Strategies** — configurable communication strategies (`uneven` or `padded`) for uneven DP buckets, allowing trade-offs between custom collectives and padded native fast-path.
 
 ### Quick Start
 
@@ -57,6 +58,9 @@ MATRIX_BASED_OPTIM_EXPERT_BUCKET_SIZE=400000000
 
 # Enable CUDA graph for optimizer compute
 export USE_CUDA_GRAPH_OPTIM=1
+
+# Uneven bucket collective strategy (default: "uneven", or use "padded")
+export UNEVEN_BUCKET_COLLECTIVE_STRATEGY=uneven
 ```
 
 The following examples are based on [`scripts/canzona/README.md`](scripts/canzona/README.md)

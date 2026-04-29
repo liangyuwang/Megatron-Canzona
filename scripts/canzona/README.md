@@ -26,6 +26,7 @@ export USE_MATRIX_BASED_OPTIM_SPLIT=1 # split QKV/FC1 weights for finer-grained 
 export USE_CUDA_GRAPH_OPTIM=1 # enable CUDA graph for optimizer compute
 export MATRIX_BASED_OPTIM_DENSE_BUCKET_SIZE=400000000 # dense buffer bucket size
 export MATRIX_BASED_OPTIM_EXPERT_BUCKET_SIZE=400000000 # expert buffer bucket size
+export UNEVEN_BUCKET_COLLECTIVE_STRATEGY=uneven # "uneven" or "padded"
 export MODEL_SIZE=1B # Dense 1B to 32B, MoE 7B-A1B to 235B-A22B
 BATCH_SIZE=4 MP_SIZE=4 EP_SIZE=1 PP_SIZE=1 TRAIN_STEPS=100000 GLOBAL_BATCH_SIZE=128 SAVE_INTERVAL=100000 bash train.sh
 ```

@@ -347,6 +347,10 @@ export USE_CUDA_GRAPH_OPTIM=${USE_CUDA_GRAPH_OPTIM:-0}
 export MATRIX_BASED_OPTIM_DENSE_BUCKET_SIZE=${MATRIX_BASED_OPTIM_DENSE_BUCKET_SIZE:-400000000}
 export MATRIX_BASED_OPTIM_EXPERT_BUCKET_SIZE=${MATRIX_BASED_OPTIM_EXPERT_BUCKET_SIZE:-400000000}
 
+# ------------------------------------------------------------
+# Matrix-based DDP Buffer Communication Strategy
+# ------------------------------------------------------------
+export UNEVEN_BUCKET_COLLECTIVE_STRATEGY=${UNEVEN_BUCKET_COLLECTIVE_STRATEGY:-"uneven"}   # "uneven" or "padded"
 
 # ============================================================
 # Launch training
