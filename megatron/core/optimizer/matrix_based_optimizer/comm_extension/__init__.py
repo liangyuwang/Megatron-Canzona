@@ -1,19 +1,128 @@
+import fcntl
+import importlib.util
 import os
+import time
 import torch
-from torch.utils.cpp_extension import load
+from torch.utils.cpp_extension import load, _get_build_directory
 
 _src_dir = os.path.dirname(os.path.abspath(__file__))
+_EXT_NAME = "coalesced_collectives"
 
-_ext = load(
-    name="coalesced_collectives",
-    sources=[os.path.join(_src_dir, "coalesced_collectives.cpp")],
-    extra_cflags=["-O3"],
-    extra_include_paths=[
-        os.path.dirname(torch.__file__) + "/include",
-        os.path.dirname(torch.__file__) + "/include/torch/csrc/api/include",
-    ],
-    verbose=True,
-)
+
+def _find_so(build_dir):
+    """Return the path to the compiled .so, or None if not found."""
+    try:
+        for fname in os.listdir(build_dir):
+            if fname.startswith(_EXT_NAME) and fname.endswith(".so"):
+                return os.path.join(build_dir, fname)
+    except FileNotFoundError:
+        pass
+    return None
+
+
+def _load_ext_from_build_dir(timeout=300):
+    """Wait for local rank 0 to compile, then load the .so via importlib.
+
+    Polls for a '.compile_done' marker file that local rank 0 writes after
+    compilation succeeds, rather than polling for the .so directly (which
+    may appear on disk before the linker finishes writing it).
+    """
+    build_dir = _get_build_directory(_EXT_NAME, verbose=False)
+    done_marker = os.path.join(build_dir, ".compile_done")
+    deadline = time.monotonic() + timeout
+
+    # Wait for the done marker indicating compilation is complete.
+    while not os.path.exists(done_marker):
+        if time.monotonic() > deadline:
+            raise RuntimeError(
+                f"Timed out ({timeout}s) waiting for {_EXT_NAME} compilation "
+                f"to complete in {build_dir}. "
+                "Ensure local rank 0 on this node compiled it."
+            )
+        time.sleep(0.5)
+
+    so_path = _find_so(build_dir)
+    if so_path is None:
+        raise RuntimeError(
+            f"Compiled {_EXT_NAME} .so not found in {build_dir} despite "
+            "done marker present."
+        )
+
+    mod_name = os.path.basename(so_path)[: -len(".so")]
+    spec = importlib.util.spec_from_file_location(mod_name, so_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_with_flock(**load_kwargs):
+    """
+    JIT-compile the extension under a proper fcntl file lock.
+
+    Unlike PyTorch's FileBaton (which uses O_CREAT|O_EXCL and os.remove),
+    fcntl.flock is automatically released by the kernel when the process
+    exits or is killed, so stale locks from crashed runs cannot happen.
+
+    Under the flock we also remove any stale FileBaton 'lock' file that a
+    previous crashed process may have left behind, so the internal
+    _jit_compile path always succeeds on try_acquire().
+
+    After successful compilation, writes a '.compile_done' marker so that
+    other local ranks know the .so is fully written and safe to load.
+    """
+    build_dir = _get_build_directory(_EXT_NAME, verbose=False)
+    os.makedirs(build_dir, exist_ok=True)
+
+    flock_path = os.path.join(build_dir, ".compile_flock")
+    done_marker = os.path.join(build_dir, ".compile_done")
+
+    with open(flock_path, "w") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        # Clean stale FileBaton lock left by a previous crashed run.
+        baton_lock = os.path.join(build_dir, "lock")
+        if os.path.exists(baton_lock):
+            os.remove(baton_lock)
+        # Remove stale done marker in case the .so was deleted but marker
+        # remained from a previous run.
+        if os.path.exists(done_marker):
+            os.remove(done_marker)
+        ext = load(**load_kwargs)
+        # Signal other ranks that compilation is complete and .so is ready.
+        with open(done_marker, "w") as dm:
+            dm.write("done")
+        return ext
+
+
+def _load_ext():
+    """Load the C++ extension, compiling it if necessary.
+
+    Local rank 0 on each node JIT-compiles under fcntl.flock, which is
+    immune to stale locks from crashed runs.  Other local ranks poll the
+    filesystem for the compiled .so and load it via importlib, completely
+    bypassing PyTorch's _jit_compile / FileBaton.
+    """
+    load_kwargs = dict(
+        name=_EXT_NAME,
+        sources=[os.path.join(_src_dir, "coalesced_collectives.cpp")],
+        extra_cflags=["-O3"],
+        extra_include_paths=[
+            os.path.dirname(torch.__file__) + "/include",
+            os.path.dirname(torch.__file__) + "/include/torch/csrc/api/include",
+        ],
+        verbose=True,
+    )
+
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if local_rank == 0:
+        return _load_with_flock(**load_kwargs)
+    else:
+        return _load_ext_from_build_dir()
+
+
+# Compile / load eagerly at import time.  This module is only imported after
+# torch.distributed is initialised (via the matrix_based_optimizer __init__
+# chain), so LOCAL_RANK is guaranteed to be set by torchrun.
+_ext = _load_ext()
 
 
 def coalesced_allgather(outputs, input, group, async_op):
