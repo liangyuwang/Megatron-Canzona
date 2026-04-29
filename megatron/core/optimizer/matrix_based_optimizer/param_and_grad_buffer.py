@@ -29,6 +29,7 @@ from ...distributed.param_and_grad_buffer import (
 from .comm_extension import (
     coalesced_allgather,
     coalesced_reduce_scatter,
+    ensure_comm_extension,
     prepare_padded_allgather,
     prepare_padded_reduce_scatter,
 )
@@ -164,6 +165,8 @@ class _MatrixBasedParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         return strategy
 
     def _start_param_sync_uneven(self, async_op: bool, data_parallel_rank, data_parallel_group):
+        if self.uneven_buckets:
+            ensure_comm_extension()
         handles = []
         device = self.buckets[0].param_data.device
         with _coalescing_manager(data_parallel_group, device=device, async_ops=async_op) as cm:
@@ -233,6 +236,8 @@ class _MatrixBasedParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         return None
 
     def _start_grad_sync_uneven(self, stream_context, async_op: bool, reduce_op, data_parallel_rank, data_parallel_group):
+        if self.uneven_buckets:
+            ensure_comm_extension()
         handles = []
         device = self.buckets[0].grad_data.device
         with stream_context, _coalescing_manager(data_parallel_group, device=device, async_ops=async_op) as cm:
