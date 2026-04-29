@@ -340,6 +340,6 @@ if __name__ == "__main__":
         expert_model_parallel_size=8,   # EP size
         total_num_layers=28,
         num_experts=64,
-        expert_param_numel=4718592, # param numel per expert: hidden_size * moe_ffn * 3
+        expert_param_numel=3145728, # param numel per expert: hidden_size * moe_ffn * 2 (3 for SwiGLU FFN, 2 for GeLU FFN)
         max_bucket_size=800000000,  # allow up to ~800M element per bucket
     )
