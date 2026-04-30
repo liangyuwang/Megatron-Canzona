@@ -6,11 +6,9 @@ import os
 import platform
 import re
 import shlex
-import socket
 import subprocess
 import sys
 import sysconfig
-import tempfile
 
 _SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 _SOURCE = os.path.join(_SRC_DIR, "coalesced_collectives.cpp")
@@ -25,32 +23,6 @@ def _file_sha256(path):
         for chunk in iter(lambda: fh.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
-
-
-def _safe_username():
-    try:
-        import pwd
-
-        return pwd.getpwuid(os.getuid()).pw_name
-    except Exception:
-        return str(os.getuid())
-
-
-def _safe_component(value):
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("._") or "unknown"
-
-
-def _node_id():
-    parts = [_safe_component(socket.gethostname())]
-    slurm_node_id = os.environ.get("SLURM_NODEID")
-    if slurm_node_id is not None:
-        parts.append(f"slurmnode{_safe_component(slurm_node_id)}")
-    for env_name in ("SLURM_JOB_ID", "SLURM_JOBID", "JOB_ID"):
-        job_id = os.environ.get(env_name)
-        if job_id:
-            parts.append(f"job{_safe_component(job_id)}")
-            break
-    return "_".join(parts)
 
 
 def _extension_suffix():
@@ -137,29 +109,11 @@ def _build_config():
     return cxx_flags, ld_flags, signature, build_key
 
 
-def _build_root():
-    override = os.environ.get("COALESCED_COLLECTIVES_BUILD_ROOT")
-    if override:
-        return os.path.abspath(override)
-
-    for env_name in ("SLURM_TMPDIR", "TMPDIR"):
-        value = os.environ.get(env_name)
-        if value:
-            return os.path.abspath(value)
-
-    return os.path.join(tempfile.gettempdir(), "comm_kernel_extensions")
-
-
-def _paths(signature, build_key):
-    build_dir = os.path.join(
-        _build_root(),
-        _safe_username(),
-        f"coalesced_collectives_{build_key}_{_node_id()}",
-    )
-    so_path = os.path.join(build_dir, _EXT_NAME + signature["extension_suffix"])
-    meta_path = os.path.join(build_dir, ".build_meta.json")
-    lock_path = os.path.join(build_dir, ".compile.lock")
-    return build_dir, so_path, meta_path, lock_path
+def _paths(signature):
+    so_path = os.path.join(_SRC_DIR, _EXT_NAME + signature["extension_suffix"])
+    meta_path = os.path.join(_SRC_DIR, ".build_meta.json")
+    lock_path = os.path.join(_SRC_DIR, ".compile.lock")
+    return _SRC_DIR, so_path, meta_path, lock_path
 
 
 def _metadata_matches(meta_path, signature):
@@ -178,47 +132,87 @@ def _write_json_atomic(path, data):
     os.replace(tmp_path, path)
 
 
+def _do_build(cxx_flags, ld_flags, tmp_so_path):
+    """Run the actual native compilation via make."""
+    env = os.environ.copy()
+    env["COMM_CXXFLAGS"] = _quote_flags(cxx_flags)
+    env["COMM_LDFLAGS"] = _quote_flags(ld_flags)
+    env.setdefault("PYTHON", sys.executable)
+
+    subprocess.run(
+        ["make", "-f", _MAKEFILE, f"SRC={_SOURCE}", f"OUT={tmp_so_path}"],
+        cwd=_SRC_DIR,
+        env=env,
+        check=True,
+    )
+
+
 def ensure_comm_extension():
-    """Build the native helper if it is missing or stale, then return its path."""
+    """Build the native helper if it is missing or stale, then return its path.
+
+    When torch.distributed is initialized, uses a rank-0-first + barrier pattern: only rank 0 compiles, other ranks
+    read the cached .so after the barrier. This avoids NFS/Lustre lock issues
+    and guarantees exactly one compilation across the job.
+    """
     cxx_flags, ld_flags, signature, build_key = _build_config()
-    build_dir, so_path, meta_path, lock_path = _paths(signature, build_key)
+    build_dir, so_path, meta_path, lock_path = _paths(signature)
     os.makedirs(build_dir, exist_ok=True)
 
     if os.path.exists(so_path) and _metadata_matches(meta_path, signature):
         return so_path
 
-    with open(lock_path, "w") as lock_fh:
-        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+    import torch
+    if not torch.distributed.is_initialized():
+        # No distributed training, build locally with a file lock.
+        with open(lock_path, "w") as lock_fh:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
 
-        if os.path.exists(so_path) and _metadata_matches(meta_path, signature):
+            if os.path.exists(so_path) and _metadata_matches(meta_path, signature):
+                return so_path
+
+            tmp_so_path = so_path + ".tmp"
+            if os.path.exists(tmp_so_path):
+                os.remove(tmp_so_path)
+
+            _do_build(cxx_flags, ld_flags, tmp_so_path)
+
+            os.replace(tmp_so_path, so_path)
+            _write_json_atomic(meta_path, signature)
             return so_path
 
+    # Distributed case: rank-0-first + barrier
+    rank = torch.distributed.get_rank()
+
+    if rank == 0:
         tmp_so_path = so_path + ".tmp"
         if os.path.exists(tmp_so_path):
             os.remove(tmp_so_path)
 
-        env = os.environ.copy()
-        env["COMM_CXXFLAGS"] = _quote_flags(cxx_flags)
-        env["COMM_LDFLAGS"] = _quote_flags(ld_flags)
-        env.setdefault("PYTHON", sys.executable)
-
-        print(f"[comm_extension] Building {_EXT_NAME} in {build_dir}", flush=True)
         try:
-            subprocess.run(
-                ["make", "-f", _MAKEFILE, f"SRC={_SOURCE}", f"OUT={tmp_so_path}"],
-                cwd=_SRC_DIR,
-                env=env,
-                check=True,
-            )
+            _do_build(cxx_flags, ld_flags, tmp_so_path)
+            os.replace(tmp_so_path, so_path)
+            _write_json_atomic(meta_path, signature)
         except subprocess.CalledProcessError as exc:
             raise RuntimeError(
                 f"Failed to build comm extension with make. "
                 f"Build directory: {build_dir}"
             ) from exc
 
-        os.replace(tmp_so_path, so_path)
-        _write_json_atomic(meta_path, signature)
-        return so_path
+    torch.distributed.barrier()
+
+    if rank != 0:
+        if not os.path.exists(so_path):
+            raise RuntimeError(
+                f"Rank {rank} expected {so_path} to exist after rank-0 build. "
+                f"Ensure all ranks share the same {build_dir}."
+            )
+        if not _metadata_matches(meta_path, signature):
+            raise RuntimeError(
+                f"Rank {rank} metadata mismatch for {so_path}. "
+                f"Ensure all ranks share the same {build_dir}."
+            )
+
+    return so_path
 
 
 def load_comm_extension():
