@@ -83,6 +83,7 @@ class _ParamAndGradBucket:
         numel_unpadded: int,
         gradient_scaling_factor: float,
         bucket_id: int,
+        buffer_name: str = "",
     ):
         self.params_list = params
         self.params = set(params)
@@ -96,6 +97,7 @@ class _ParamAndGradBucket:
         self.numel_unpadded = numel_unpadded
         self.gradient_scaling_factor = gradient_scaling_factor
         self.bucket_id = bucket_id
+        self.buffer_name = buffer_name
         self.param_to_index = {}
         offset = 0
         for param in params:
@@ -520,8 +522,11 @@ class _ParamAndGradBuffer:
         gradient_scaling_factor: float,
         param_indices: List[int],
         nccl_ub: bool,
+        is_matrix_based_opt=False,
+        buffer_name: str = "",
     ):
         self.ddp_config = ddp_config
+        self.buffer_name = buffer_name
         self.params = params
         self.param_indices = param_indices
 
@@ -779,7 +784,7 @@ class _ParamAndGradBuffer:
                 f"{bucket.grad_data.nelement()} padded size):"
             )
             for param in bucket.params:
-                log_strs.append(f"\t{param_to_name[param]}")
+                log_strs.append(f'\t{param_to_name[param], param.shape, 'Matrix Based Optimizer' if is_matrix_based_opt else 'Adam Optimizer'}')
         log_on_each_pipeline_stage(logger, logging.INFO, "\n".join(log_strs))
 
     def scale_gradients(self, scaling_factor: float) -> None:
@@ -839,6 +844,7 @@ class _ParamAndGradBuffer:
             numel_unpadded=numel_unpadded,
             gradient_scaling_factor=self.gradient_scaling_factor,
             bucket_id=bucket_id,
+            buffer_name=self.buffer_name,
         )
         for bucket_param in bucket_params:
             assert bucket_param not in self.param_to_bucket

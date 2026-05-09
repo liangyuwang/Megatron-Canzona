@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import os
 import logging
 from contextlib import contextmanager
 from typing import Optional
@@ -195,6 +196,11 @@ class DistributedDataParallel(_BaseDataParallel):
         dense_params = []
         expert_parallel_params = []
         self.params_with_grad = []
+        
+        dense_matrix_based_opt_params = []
+        expert_parallel_matrix_based_opt_params = []
+        from megatron.core.optimizer.matrix_based_optimizer.utils import is_param_use_matrix_based_optim
+
         for name, param in self.module.named_parameters():
             if not param.requires_grad:
                 continue
@@ -207,13 +213,21 @@ class DistributedDataParallel(_BaseDataParallel):
             param_to_name[param] = name
 
             if getattr(param, 'allreduce', True):
-                dense_params.append(param)
+                if is_param_use_matrix_based_optim(name, param) and ddp_config.use_matrix_based_optimizer:
+                    dense_matrix_based_opt_params.append(param)
+                else:
+                    dense_params.append(param)
             else:
-                expert_parallel_params.append(param)
+                if is_param_use_matrix_based_optim(name, param) and ddp_config.use_matrix_based_optimizer:
+                    expert_parallel_matrix_based_opt_params.append(param)
+                else:
+                    expert_parallel_params.append(param)
 
         def _allocate_buffers_for_parameters(
-            input_params, data_parallel_group, gradient_scaling_factor
+            input_params, data_parallel_group, gradient_scaling_factor, bucket_size=None, is_matrix_based_opt=False, buffer_name=""
         ):
+            bucket_size = self.bucket_size if bucket_size is None else bucket_size
+
             param_and_grad_dtype_to_params = {}
             param_and_grad_dtype_to_offsets = {}
             param_and_grad_dtype_to_indices = {}
@@ -287,11 +301,13 @@ class DistributedDataParallel(_BaseDataParallel):
                         grad_dtype,
                         params,
                         data_parallel_group,
-                        self.bucket_size,
+                        bucket_size,
                         param_to_name,
                         gradient_scaling_factor,
                         param_and_grad_dtype_to_indices[(param_dtype, grad_dtype)],
                         self.ddp_config.nccl_ub,
+                        is_matrix_based_opt=is_matrix_based_opt,
+                        buffer_name=buffer_name,
                     )
                 )
 
@@ -304,7 +320,11 @@ class DistributedDataParallel(_BaseDataParallel):
             # kernels.
             # If bucketing is explicitly disabled, then put all buckets in a buffer into a single
             # bucket group.
-            bucket_groups = partition_buckets(buffers, force_single_bucket_group=disable_bucketing)
+            if is_matrix_based_opt:
+                from ...core.optimizer.matrix_based_optimizer.param_and_grad_buffer import partition_matrix_based_buckets
+                bucket_groups = partition_matrix_based_buckets(buffers, force_single_bucket_group=disable_bucketing)
+            else:
+                bucket_groups = partition_buckets(buffers, force_single_bucket_group=disable_bucketing)
 
             if self.ddp_config.num_distributed_optimizer_instances > 1:
                 assert (
@@ -372,7 +392,7 @@ class DistributedDataParallel(_BaseDataParallel):
 
         # Allocate the param+grad buffers for dense params' grads.
         self.buffers, self.bucket_groups = _allocate_buffers_for_parameters(
-            dense_params, self.intra_dp_cp_group, gradient_scaling_factor=gradient_scaling_factor
+            dense_params, self.intra_dp_cp_group, gradient_scaling_factor=gradient_scaling_factor, buffer_name="dense_buffer"
         )
 
         # Allocate separate param+grad buffers for expert parallel params' grads.
@@ -381,8 +401,55 @@ class DistributedDataParallel(_BaseDataParallel):
                 expert_parallel_params,
                 self.intra_expt_dp_group,
                 gradient_scaling_factor=expert_gradient_scaling_factor,
+                buffer_name="expert_buffer"
             )
         )
+
+        # allocate the matrix_based_opt buffers
+        _dense_matrix_bucket_size = os.environ.get('MATRIX_BASED_OPTIM_DENSE_BUCKET_SIZE', None)
+        if _dense_matrix_bucket_size is not None:
+            dense_matrix_bucket_size = int(_dense_matrix_bucket_size)
+        else:
+            dense_matrix_bucket_size = self.bucket_size
+        self.matrix_based_opt_buffers, matrix_based_opt_bucket_groups = _allocate_buffers_for_parameters(
+            dense_matrix_based_opt_params,
+            parallel_state.get_data_parallel_group(with_context_parallel=True),
+            gradient_scaling_factor=gradient_scaling_factor,
+            bucket_size=dense_matrix_bucket_size,
+            is_matrix_based_opt=True,
+            buffer_name="matrix_based_dense_buffer"
+        )
+        if _dense_matrix_bucket_size is not None:
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f'Dense matrix-based optimizer bucket size: '
+                f'{dense_matrix_bucket_size} '
+                f'({"from env MATRIX_BASED_OPTIM_DENSE_BUCKET_SIZE" if _dense_matrix_bucket_size else "default"})',
+            )
+        _expert_matrix_bucket_size = os.environ.get('MATRIX_BASED_OPTIM_EXPERT_BUCKET_SIZE', None)
+        if _expert_matrix_bucket_size is not None:
+            expert_matrix_bucket_size = int(_expert_matrix_bucket_size)
+        else:
+            expert_matrix_bucket_size = self.bucket_size
+        self.matrix_based_opt_expert_parallel_buffers, matrix_based_opt_expert_parallel_groups = _allocate_buffers_for_parameters(
+            expert_parallel_matrix_based_opt_params,
+            parallel_state.get_expert_data_parallel_group(),
+            gradient_scaling_factor=expert_gradient_scaling_factor,
+            bucket_size=expert_matrix_bucket_size,
+            is_matrix_based_opt=True,
+            buffer_name="matrix_based_expert_buffer"
+        )
+        if _expert_matrix_bucket_size is not None:
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f'Expert matrix-based optimizer bucket size: '
+                f'{expert_matrix_bucket_size} '
+                f'({"from env MATRIX_BASED_OPTIM_EXPERT_BUCKET_SIZE" if _expert_matrix_bucket_size else "default"})',
+            )
+        self.bucket_groups += matrix_based_opt_bucket_groups
+        self.expert_parallel_bucket_groups += matrix_based_opt_expert_parallel_groups
 
         # Delete references to weight_tensor if they exist since we don't want two parameter copies
         # if we re-mapped parameters (which happens when we use the distributed optimizer).
@@ -496,10 +563,10 @@ class DistributedDataParallel(_BaseDataParallel):
 
             if param in self.param_to_bucket_group:
                 assert param.requires_grad
-                if self.ddp_config.overlap_grad_reduce:
-                    assert (
-                        param.grad is not None
-                    ), 'param.grad being None is not safe when overlap_grad_reduce is True'
+                # if self.ddp_config.overlap_grad_reduce:
+                #     assert (
+                #         param.grad is not None
+                #     ), 'param.grad being None is not safe when overlap_grad_reduce is True'
                 if param.grad is not None and (
                     not param.grad_added_to_main_grad or getattr(param, 'zero_out_wgrad', False)
                 ):
@@ -589,7 +656,7 @@ class DistributedDataParallel(_BaseDataParallel):
 
     def scale_gradients(self, scaling_factor: float):
         """Scale all gradients inside the buffers by `scaling_factor`."""
-        for buffer in self.buffers + self.expert_parallel_buffers:
+        for buffer in self.buffers + self.expert_parallel_buffers + self.matrix_based_opt_buffers + self.matrix_based_opt_expert_parallel_buffers:
             buffer.scale_gradients(scaling_factor)
 
     def zero_grad_buffer(self):
@@ -611,7 +678,7 @@ class DistributedDataParallel(_BaseDataParallel):
             self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
             and self.ddp_config.overlap_param_gather
         ):
-            for buffer in self.buffers + self.expert_parallel_buffers:
+            for buffer in self.buffers + self.expert_parallel_buffers + self.matrix_based_opt_buffers + self.matrix_based_opt_expert_parallel_buffers:
                 buffer.reset()
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.reset()

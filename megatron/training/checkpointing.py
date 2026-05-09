@@ -15,6 +15,7 @@ from pathlib import Path
 
 import numpy as np
 from time import time
+import gc
 
 import torch
 from torch.distributed.checkpoint import default_planner, FileSystemReader
@@ -27,6 +28,7 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import \
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.fp8_utils import is_float8tensor, dequantize_fp8_tensor
 from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.optimizer.matrix_based_optimizer import is_matrix_based_optim
 from .async_utils import schedule_async_save, is_empty_async_queue
 from .global_vars import get_args
 from .utils import unwrap_model, print_rank_0, append_to_progress_log, is_last_rank
@@ -79,6 +81,45 @@ def set_checkpoint_version(value):
 def get_checkpoint_version():
     global _CHECKPOINT_VERSION
     return _CHECKPOINT_VERSION
+
+
+def clean_param_groups(param_groups, keys_to_remove):
+    keys_to_remove = set(keys_to_remove)
+    for g in param_groups:
+        for key in keys_to_remove:
+            g.pop(key, None)
+    return param_groups
+
+
+def extract_key_paths(d, target_key, current_path=[]):
+    results = []
+
+    if isinstance(d, dict):
+        for key, value in d.items():
+            new_path = current_path + [key]
+            if key == target_key:
+                results.append((new_path, value))
+            else:
+                results.extend(extract_key_paths(value, target_key,new_path))
+    elif isinstance(d, list):
+        for i, item in enumerate(d):
+            new_path = current_path + [i]
+            results.extend(extract_key_paths(item, target_key,new_path))
+
+    return results
+
+
+def set_value_by_path(d, path, value):
+    for key in path[:-1]:
+        if isinstance(d, list):
+            d = d[key]
+        else:
+            d = d[key]
+    final_key = path[-1]
+    if isinstance(d, list):
+        d[final_key] = value
+    else:
+        d[final_key] = value
 
 
 def check_checkpoint_args(checkpoint_args):
@@ -521,6 +562,15 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             model_sd_kwargs=dict(metadata=sharded_sd_metadata),
             rerun_state=rerun_state,
         )
+        # do not save/load origin_shape/async tp map as common state
+        if not args.no_save_optim and is_matrix_based_optim(args.optimizer):
+            torch.cuda.empty_cache()
+            gc.collect()
+            for optim_idx, optim in state_dict['optimizer'].items():
+                for g in optim['optimizer']['param_groups']:
+                    clean_param_groups(optim['optimizer']['param_groups'],
+                                            ['origin_shape', 'balanced_micro_tp_groups', 'shapes_map'])
+
 
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
         if ckpt_type == CheckpointType.GLOBAL and ckpt_format == "torch_dist":
@@ -1529,6 +1579,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 optim_sd_kwargs=optim_sd_kwargs, model_sd_kwargs=model_sd_kwargs,
                 rerun_state=gen_sd_rerun_state
             )
+            # extract origin_shape from inited matrix-based optimizer for loading later
+            matrix_based_opt_origin_shape_paths = extract_key_paths(load_kwargs['sharded_state_dict'], 'origin_shape')
     elif args.ckpt_format == "torch_dcp":
         model_sd = model[0].state_dict()
         optimizer_sd = optimizer.state_dict(is_loading=True)
@@ -1587,6 +1639,10 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     if state_dict is None:
         # Iteration and num_floating_point_operations_so_far default to 0.
         return 0, 0
+
+    if len(matrix_based_opt_origin_shape_paths) > 0:
+        for path,value in matrix_based_opt_origin_shape_paths:
+            set_value_by_path(state_dict, path, value)
 
     # Set checkpoint version.
     set_checkpoint_version(state_dict.get('checkpoint_version', 0))

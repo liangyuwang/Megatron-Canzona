@@ -187,6 +187,89 @@ class OptimizerConfig:
     config_logger_dir: str = ""
     """When non-empty, dumps entry-point configs to config_logger_dir"""
 
+    ################
+    # Matrix based optimizer
+    ################
+    use_muon_optimizer: bool = False
+
+    use_soap_optimizer: bool = False
+
+    split_matrix_based_optimizer_params: bool = False
+    """If true, split certain parameters when use matrix_based_optimizer."""
+
+    ################
+    # Canzona Optimizer
+    ################
+    # DP Balanced Optimizer
+    use_dp_balanced_opt: bool = False
+    """Enable DP balanced optimizer."""
+
+    dp_balanced_opt_alpha: float = 1.0
+    """Alpha parameter for DP balanced optimizer."""
+
+    dp_balanced_opt_log_visualization: bool = False
+    """Enable log visualization for DP balanced optimizer."""
+
+    dp_balanced_opt_log_path: Optional[str] = None
+    """Path for DP balanced optimizer log visualization."""
+
+    dp_balanced_opt_cost: str = "numel"
+    """Cost model for DP balanced optimizer. Choices: "numel", "flops"."""
+
+    # TP Async Optimizer
+    use_tp_async_opt: bool = False
+    """Enable TP async optimizer."""
+
+    async_tp_fuse_comm: bool = False
+    """Enable fused communication for TP balanced optimizer."""
+
+    # TP Balanced Optimizer
+    use_tp_balanced_opt: bool = False
+    """Enable TP balanced optimizer."""
+
+    tp_balanced_opt_log_visualization: bool = False
+    """Enable log visualization for TP balanced optimizer."""
+
+    tp_balanced_opt_log_path: Optional[str] = None
+    """Path for TP balanced optimizer log visualization."""
+
+    tp_balanced_opt_fuse_space: int = 400
+    """Fusion space size in MB for TP balanced optimizer."""
+
+    tp_balanced_opt_cost: str = "numel"
+    """Cost model for TP balanced optimizer. Choices: "numel", "flops"."""
+    
+    # Muon optimizer configuration in Canzona
+    nesterov_acceleration: bool = False
+    """If true, use nesterov accelerated version of momentum."""
+
+    muon_ns_norm_eps: float = 1e-7
+    """Normalization epsilon for Newton-Schulz process in Muon optimizer."""
+
+    muon_ns_steps: int = 5
+    """Number of steps of Newton-Schulz iteration."""
+
+    muon_ns_coefficient_type: str = "simple"
+    """NS coefficient set for Muon optimizer."""
+    
+    # SOAP optimizer configuration in Canzona
+    # soap
+    shampoo_beta: float = 0.99
+
+    soap_precondition_frequency: int = 10
+
+    soap_max_precond_dim: int = 10000
+
+    soap_merge_dims: bool = False
+
+    soap_precondition_1d: bool = False
+
+    soap_normalize_grads: bool = False
+
+    soap_data_format: str = 'channels_first'
+    
+    soap_correct_bias: bool = True
+
     def __post_init__(self):
         """Check the validity of the config."""
 
